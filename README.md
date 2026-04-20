@@ -1,14 +1,89 @@
 # agent-cluster
-Agent cluster framework used for AI For TSCM 2
 
-## Architecture Overview
+Agent-cluster framework used for AI For TSCM 2. It provides a lightweight controller/worker model where a central controller orchestrates a fleet of networked Agno agents over HTTP.
 
-This project uses a distributed controller/worker architecture in which one controller process orchestrates any number of remote worker agents over HTTP, while each worker runs its own local Agno `Agent` instance and exposes a small API for health checks and task execution.  The design avoids Agno Teams and AgentOS by moving coordination into plain Python services, which makes each worker independently deployable, replaceable, and reachable across the network. 
+## Overview
 
-The system has three main layers: shared contracts, worker services, and a controller service.  Shared contracts define typed request and response models with Pydantic so both sides validate the same task payloads and result schemas, worker services wrap specialized Agno agents behind endpoints like `/health` and `/run`, and the controller uses `httpx.AsyncClient` to fan out tasks to selected workers concurrently and aggregate their results. 
+`agent-cluster` runs one controller service and any number of worker services:
 
-A typical request flow starts when a user or upstream system sends a top-level task to the controller.  The controller classifies the job, selects workers by capability such as code generation, review, testing, or documentation, dispatches subtasks over HTTP in parallel, receives normalized worker outputs, and returns either a combined result set or a synthesized final response.  Each worker remains responsible for its own prompts, tools, model choice, and Agno execution loop via `Agent.run()` or `Agent.arun()`, while the controller remains responsible for routing, retries, timeouts, and result aggregation. 
+- Each **worker** runs a local Agno `Agent` and exposes a small HTTP API (e.g. `/health`, `/run`) for task execution.
+- The **controller** reads a `workers.yaml` registry, selects workers by role (code, review, test, docs, general), and dispatches tasks over HTTP.
+- Shared Pydantic models in `schemas.py` define the request/response contracts used by both controller and workers.
 
-The recommended file structure is intentionally small so the system stays easy to reason about and test.  A minimal layout is: `controller.py` for orchestration and fleet routing, `worker.py` for one networked worker service template, `schemas.py` for shared Pydantic models, `registry.py` or `workers.yaml` for fleet definitions, `.env` for model and host configuration, and optional `workers/` submodules if different worker roles need separate prompt/tool bundles.  This structure keeps network contracts stable while allowing each worker role to evolve independently.
+This design keeps each worker independently deployable and replaceable, while the controller stays thin and stateless, focused on routing, retries, and result aggregation.
 
-Key design decisions are: keep Agno inside workers instead of trying to distribute Agno internals directly, use HTTP as the transport boundary because it is easy to debug and deploy, and make the controller stateless except for in-memory routing and aggregation state.  Sessions and user identifiers should still be forwarded to workers so Agno can preserve context per worker when needed, but worker-to-worker communication should be avoided in the first version so all coordination stays visible and deterministic through the controller.  This produces a simple “fleet” model where scaling usually means adding more worker instances or roles rather than redesigning orchestration. 
+## Project layout
+
+```text
+agent-cluster/
+├── requirements.txt
+├── workers.yaml
+├── schemas.py
+├── worker.py
+└── controller.py
+```
+
+- `requirements.txt` — runtime dependencies for controller and workers.
+- `workers.yaml` — fleet registry with worker IDs, roles, URLs, enabled flags, and tags.
+- `schemas.py` — shared Pydantic models (`AgentTask`, `AgentResult`, `HealthResponse`, `WorkerInfo`, etc.).
+- `worker.py` — FastAPI app that wraps a local Agno agent and exposes `/health` and `/run`.
+- `controller.py` — FastAPI app that loads the registry and sends tasks to matching workers over HTTP.
+
+For detailed architecture, design decisions, and YAML format, see `Architecture.md`.
+
+## Getting started
+
+1. **Install dependencies**
+
+   ```bash
+   python3.11 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+
+2. **Configure workers**
+
+   Edit `workers.yaml` to define your workers, their roles, and URLs.
+
+3. **Run a worker**
+
+   ```bash
+   WORKER_ID=general-1 WORKER_ROLE=general MODEL_ID=gemma4 \
+     uvicorn worker:app --host 0.0.0.0 --port 8001
+   ```
+
+4. **Run the controller**
+
+   ```bash
+   uvicorn controller:app --host 0.0.0.0 --port 8000
+   ```
+
+## Example usage
+
+- Check a worker:
+
+  ```bash
+  curl http://localhost:8001/health
+  ```
+
+- List workers from the controller:
+
+  ```bash
+  curl http://localhost:8000/workers
+  ```
+
+- Dispatch a task:
+
+  ```bash
+  curl -X POST http://localhost:8000/dispatch \
+    -H "Content-Type: application/json" \
+    -d '{
+      "role": "general",
+      "prompt": "Summarize how this controller/worker architecture works."
+    }'
+  ```
+
+## Documentation
+
+- High-level and low-level architecture details live in `Architecture.md`.
+- Agno, FastAPI, Pydantic, and HTTPX usage patterns follow their respective official docs.

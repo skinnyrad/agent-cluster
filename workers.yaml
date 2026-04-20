@@ -1,0 +1,40 @@
+workers:
+  - worker_id: general-1
+    role: general
+    url: http://localhost:8001
+    enabled: true
+    tags:
+      - default
+      - general
+
+  - worker_id: code-1
+    role: code
+    url: http://localhost:8002
+    enabled: true
+    tags:
+      - python
+      - implementation
+
+  - worker_id: review-1
+    role: review
+    url: http://localhost:8003
+    enabled: true
+    tags:
+      - critique
+      - quality
+
+  - worker_id: test-1
+    role: test
+    url: http://localhost:8004
+    enabled: true
+    tags:
+      - pytest
+      - validation
+
+  - worker_id: docs-1
+    role: docs
+    url: http://localhost:8005
+    enabled: true
+    tags:
+      - writing
+      - documentation
