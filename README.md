@@ -1,6 +1,6 @@
 # agent-cluster
 
-Agent-cluster framework used for AI For TSCM 2. It provides a lightweight controller/worker model where a central controller orchestrates a fleet of networked Agno agents over HTTP.
+Agent-cluster framework used in the AI For TSCM 2 course. It provides a lightweight controller/worker model where a central controller (router) orchestrates a fleet of networked Agno agents over HTTP.
 
 ## Overview
 
@@ -36,8 +36,8 @@ For detailed architecture, design decisions, and YAML format, see `Architecture.
 1. **Install dependencies**
 
    ```bash
-   python3.11 -m venv .venv
-   source .venv/bin/activate
+   python3 -m venv venv
+   source ./venv/bin/activate
    pip install -r requirements.txt
    ```
 
