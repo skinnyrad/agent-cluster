@@ -1,0 +1,7 @@
+agno
+ollama
+fastapi
+uvicorn[standard]
+pydantic
+httpx
+python-dotenv
