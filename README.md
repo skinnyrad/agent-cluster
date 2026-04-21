@@ -50,7 +50,8 @@ For detailed architecture and design decisions, see `Architecture.md`.
    ```bash
    WORKER_ID=worker-1 MODEL_ID=gemma4 \
      uvicorn worker:app --host 0.0.0.0 --port 8001
-
+   ```
+   ```
    WORKER_ID=worker-2 MODEL_ID=gemma4 \
      uvicorn worker:app --host 0.0.0.0 --port 8002
    ```
