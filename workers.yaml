@@ -8,7 +8,7 @@ workers:
 
   - worker_id: worker-2
     url: http://localhost:8002
-    model_id: gemma4
+    model_id: granite4
     enabled: true
     tags:
       - default

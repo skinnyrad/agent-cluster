@@ -1,5 +1,34 @@
 ## Agent-Cluster Architecture
 
+## Chat client (`chat.py`)
+
+`chat.py` is the recommended way to interact with the fleet during development. It wraps `POST /dispatch` in a fully interactive terminal session.
+
+**Input handling** — built on `prompt_toolkit` `PromptSession` with `InMemoryHistory`:
+- ↑ / ↓ arrows cycle through the input history for the current session.
+- ← / → arrows and all standard readline editing shortcuts work within the current line.
+
+**Conversation context** — a `deque(maxlen=12)` stores the last 12 messages (6 full user+assistant turns). Before each dispatch call, these are serialised into a `[Conversation so far]` preamble prepended to the current prompt so the router Agent has multi-turn context.
+
+**Verbose status** — a threaded spinner cycles through stage labels while the blocking HTTP request is in flight:
+1. *Tasking fleet…*
+2. *Router decomposing task…*
+3. *Dispatching to workers…*
+4. *Waiting on fleet results…*
+5. *Synthesizing response…*
+6. ✓ Done! (request_id: …)
+
+After the response arrives, the client prints the subtask plan (worker ID, role preview, task preview), per-worker result panels (green on success, red on error), and the final synthesis rendered as Rich Markdown.
+
+**Slash commands:**
+
+| Command | Action |
+|---|---|
+| `/workers` | Fetch `GET /workers` and render a status table |
+| `/clear` | Clear the rolling conversation history |
+| `/help` | Show available slash commands |
+| `/quit` | Exit |
+
 ## References
 
 - https://docs.agno.com
@@ -41,16 +70,18 @@ agent-cluster/
 ├── workers.yaml
 ├── schemas.py
 ├── worker.py
-└── controller.py
+├── controller.py
+└── chat.py
 ```
 
 ## File roles
 
-- `requirements.txt` — runtime dependencies for controller and workers.
+- `requirements.txt` — runtime dependencies for all components.
 - `workers.yaml` — fleet registry with worker IDs, URLs, model IDs, enabled flags, and tags. No `role` field.
 - `schemas.py` — shared Pydantic models: `AgentTask`, `AgentResult`, `HealthResponse`, `WorkerInfo`, `SubTask`, `DispatchRequest`, `DispatchResponse`.
 - `worker.py` — generic FastAPI app exposing `/health` and `/run`. Creates a per-request `Agent` using `task.system_prompt`.
 - `controller.py` — FastAPI app with router Agent (task decomposition) and synthesizer Agent (result merging).
+- `chat.py` — interactive terminal chat client. Maintains a rolling 6-turn conversation history (`deque(maxlen=12)`), sends augmented prompts to `/dispatch`, renders verbose per-stage status output, and supports `/workers`, `/clear`, `/help`, and `/quit` slash commands.
 
 ## Shared models (`schemas.py`)
 
@@ -75,6 +106,9 @@ agent-cluster/
 - `ROUTER_MODEL_ID` — Ollama model for the router Agent (default: `gemma4`)
 - `SYNTHESIZER_MODEL_ID` — Ollama model for the synthesizer Agent (default: `gemma4`)
 - `HEALTH_POLL_INTERVAL` — seconds between background worker health probes (default: `30`)
+
+**Chat client (`chat.py`):**
+- `CONTROLLER_URL` — base URL of the controller (default: `http://localhost:8000`); can also be set with `--url`
 
 ## workers.yaml format
 

@@ -6,3 +6,5 @@ pydantic
 httpx
 python-dotenv
 openai
+prompt_toolkit
+rich

@@ -20,14 +20,16 @@ agent-cluster/
 ├── workers.yaml
 ├── schemas.py
 ├── worker.py
-└── controller.py
+├── controller.py
+└── chat.py
 ```
 
-- `requirements.txt` — runtime dependencies for controller and workers.
+- `requirements.txt` — runtime dependencies for all components.
 - `workers.yaml` — fleet registry with worker IDs, URLs, model IDs, enabled flags, and tags. No `role` field.
 - `schemas.py` — shared Pydantic models (`AgentTask`, `AgentResult`, `WorkerInfo`, `SubTask`, `DispatchRequest`, `DispatchResponse`, etc.).
 - `worker.py` — FastAPI app exposing `/health` and `/run`. Creates a per-request `Agent` using the provided `system_prompt`.
 - `controller.py` — FastAPI app with a two-stage LLM pipeline: router Agent (task decomposition) + synthesizer Agent (result merging).
+- `chat.py` — interactive terminal chat client for the controller with conversation history, slash commands, and verbose status output.
 
 For detailed architecture and design decisions, see `Architecture.md`.
 
@@ -77,7 +79,24 @@ For detailed architecture and design decisions, see `Architecture.md`.
   curl http://localhost:8000/workers
   ```
 
-- Dispatch a task (the controller decides how many workers to use and what each one does):
+- **Interactive chat (recommended):** Start a conversation with the fleet using the built-in terminal client:
+
+  ```bash
+  python chat.py
+  # or point at a non-default controller:
+  python chat.py --url http://localhost:8000
+  # or via environment variable:
+  CONTROLLER_URL=http://localhost:8000 python chat.py
+  ```
+
+  The chat client supports:
+  - **↑ / ↓** arrows to cycle through your previous inputs
+  - **← / →** arrows to move the cursor within the current line
+  - **6-turn rolling context** — the last 6 user+assistant exchanges are included automatically as conversation history on each dispatch
+  - **Verbose status** — a live spinner cycles through *Tasking fleet → Router decomposing → Dispatching to workers → Waiting on fleet results → Synthesizing...* while the request is in flight
+  - **Slash commands** — `/workers`, `/clear`, `/help`, `/quit`
+
+- Dispatch a task directly (the controller decides how many workers to use and what each one does):
 
   ```bash
   curl -X POST http://localhost:8000/dispatch \
@@ -99,7 +118,17 @@ For detailed architecture and design decisions, see `Architecture.md`.
   }
   ```
 
+### Chat slash commands
+
+| Command | Description |
+|---|---|
+| `/workers` | Display a live status table of all registered workers |
+| `/clear` | Clear the rolling conversation history |
+| `/help` | Show available slash commands |
+| `/quit` | Exit the chat client |
+
 ## Documentation
 
 - Architecture details and design decisions live in `Architecture.md`.
 - Agno, FastAPI, Pydantic, and HTTPX usage patterns follow their respective official docs.
+- `chat.py --help` shows CLI flags for the interactive client.
