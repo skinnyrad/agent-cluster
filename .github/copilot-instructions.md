@@ -42,13 +42,20 @@ This project implements a **dynamic agent router** pattern:
 - **Shared Models** (`schemas.py`): Pydantic models for request/response contracts — `AgentTask` (includes `system_prompt`), `AgentResult`, `WorkerInfo` (no role), `SubTask`, `DispatchRequest`, `DispatchResponse`.
 - **Fleet Registry** (`workers.yaml`): Lists workers by `worker_id`, `url`, `model_id`, `enabled`, and `tags`. No `role` field — the controller assigns roles dynamically at dispatch time.
 
+### Worker health tracking
+The controller probes every enabled worker's `GET /health` at startup (before serving any requests) and again on a background timer (`HEALTH_POLL_INTERVAL`, default 30 s). Only workers that return `ok: true` with a matching `worker_id` are considered live. The `/dispatch` endpoint only routes tasks to live workers. If a dispatch call to a worker fails mid-flight, that worker is immediately marked dead and excluded from subsequent requests until the next successful health probe.
+
+`GET /workers` returns each worker's current `alive` status alongside its registry metadata.
+
 ### Request flow
-1. `POST /dispatch` receives `{"prompt": "..."}`.
-2. Controller's **router Agent** reads the available workers and outputs a JSON plan: `[{worker_id, system_prompt, task_prompt}, ...]`.
-3. Controller dispatches each subtask to its assigned worker via `POST /run`, with the dynamic `system_prompt` embedded in the `AgentTask`.
-4. Workers create a per-request `Agent` using the provided `system_prompt` and execute the task.
-5. Controller's **synthesizer Agent** combines all results into a final answer.
-6. `DispatchResponse` returns `request_id`, `subtasks` plan, raw `results`, and `synthesis`.
+1. **Startup** — controller probes all enabled workers and builds the initial live-worker set.
+2. `POST /dispatch` receives `{"prompt": "..."}`.
+3. Controller's **router Agent** receives only the currently live workers and outputs a JSON plan: `[{worker_id, system_prompt, task_prompt}, ...]`.
+4. Controller dispatches each subtask to its assigned worker via `POST /run`, with the dynamic `system_prompt` embedded in the `AgentTask`.
+5. Workers create a per-request `Agent` using the provided `system_prompt` and execute the task.
+6. If a worker fails mid-dispatch it is immediately marked dead.
+7. Controller's **synthesizer Agent** combines all results into a final answer.
+8. `DispatchResponse` returns `request_id`, `subtasks` plan, raw `results`, and `synthesis`.
 
 ## Key Conventions
 
@@ -57,7 +64,7 @@ This project implements a **dynamic agent router** pattern:
 - **Workers are stateless per request** — a new `Agent` is created per `/run` call using `task.system_prompt`.
 - **Environment variables:**
   - Workers: `WORKER_ID`, `MODEL_ID`, `WORKER_STATUS`
-  - Controller: `ROUTER_MODEL_ID`, `SYNTHESIZER_MODEL_ID`
+  - Controller: `ROUTER_MODEL_ID`, `SYNTHESIZER_MODEL_ID`, `HEALTH_POLL_INTERVAL` (default: `30`)
 - **Router fallback:** If the router agent returns unparseable JSON, the controller broadcasts the original prompt to all workers with a generic system prompt.
 - **Extending the worker pool:** Add entries to `workers.yaml` and start the corresponding `uvicorn worker:app` processes. No schema changes needed.
 

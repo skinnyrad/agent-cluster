@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import httpx
 import yaml
@@ -12,15 +14,17 @@ from fastapi import FastAPI, HTTPException
 from agno.agent import Agent
 from agno.models.ollama import Ollama
 
-from schemas import AgentTask, AgentResult, WorkerInfo, SubTask, DispatchRequest, DispatchResponse
+from schemas import AgentTask, AgentResult, HealthResponse, WorkerInfo, SubTask, DispatchRequest, DispatchResponse
 
 BASE_DIR = Path(__file__).resolve().parent
 REGISTRY_PATH = BASE_DIR / "workers.yaml"
 
 ROUTER_MODEL_ID = os.getenv("ROUTER_MODEL_ID", "gemma4")
 SYNTHESIZER_MODEL_ID = os.getenv("SYNTHESIZER_MODEL_ID", "gemma4")
+HEALTH_POLL_INTERVAL = int(os.getenv("HEALTH_POLL_INTERVAL", "30"))
 
-app = FastAPI(title="Agno Fleet Controller")
+# worker_id -> alive; replaced atomically on each refresh
+_live_workers: Dict[str, bool] = {}
 
 
 def load_workers() -> List[WorkerInfo]:
@@ -29,6 +33,58 @@ def load_workers() -> List[WorkerInfo]:
     data = yaml.safe_load(REGISTRY_PATH.read_text()) or {}
     workers = data.get("workers", [])
     return [WorkerInfo.model_validate(worker) for worker in workers if worker.get("enabled", True)]
+
+
+def get_available_workers() -> List[WorkerInfo]:
+    """Return enabled workers that passed their last health probe."""
+    return [w for w in load_workers() if _live_workers.get(w.worker_id, False)]
+
+
+async def probe_worker(client: httpx.AsyncClient, worker: WorkerInfo) -> bool:
+    """Return True only if the worker is reachable, reports ok=True, and its worker_id matches."""
+    try:
+        r = await client.get(f"{worker.url}/health", timeout=5.0)
+        if r.status_code != 200:
+            return False
+        data = HealthResponse.model_validate(r.json())
+        return data.ok and data.worker_id == worker.worker_id and data.status != "offline"
+    except Exception:
+        return False
+
+
+async def refresh_worker_status() -> None:
+    """Probe all enabled workers concurrently and atomically replace _live_workers."""
+    global _live_workers
+    workers = load_workers()
+    async with httpx.AsyncClient() as client:
+        results = await asyncio.gather(*(probe_worker(client, w) for w in workers))
+    _live_workers = {w.worker_id: alive for w, alive in zip(workers, results)}
+
+
+async def _background_health_poll() -> None:
+    while True:
+        await asyncio.sleep(HEALTH_POLL_INTERVAL)
+        try:
+            await refresh_worker_status()
+        except Exception:
+            pass  # never let a refresh failure kill the loop
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await refresh_worker_status()
+    poll_task = asyncio.create_task(_background_health_poll())
+    try:
+        yield
+    finally:
+        poll_task.cancel()
+        try:
+            await poll_task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="Agno Fleet Controller", lifespan=lifespan)
 
 
 def parse_router_plan(text: str, workers: List[WorkerInfo]) -> List[SubTask]:
@@ -67,14 +123,20 @@ def parse_router_plan(text: str, workers: List[WorkerInfo]) -> List[SubTask]:
 
 @app.get("/workers")
 def list_workers():
-    return {"workers": [worker.model_dump() for worker in load_workers()]}
+    workers = load_workers()
+    return {
+        "workers": [
+            {**worker.model_dump(), "alive": _live_workers.get(worker.worker_id, False)}
+            for worker in workers
+        ]
+    }
 
 
 @app.post("/dispatch", response_model=DispatchResponse)
 async def dispatch(request: DispatchRequest):
-    workers = load_workers()
+    workers = get_available_workers()
     if not workers:
-        raise HTTPException(status_code=503, detail="No enabled workers available")
+        raise HTTPException(status_code=503, detail="No live workers available")
 
     request_id = str(uuid.uuid4())
 
@@ -143,6 +205,8 @@ async def dispatch(request: DispatchRequest):
                 response.raise_for_status()
                 results.append(AgentResult.model_validate(response.json()))
             except Exception as exc:
+                # Mark worker dead immediately so it's excluded from the next dispatch
+                _live_workers[worker.worker_id] = False
                 results.append(AgentResult(
                     task_id=task.task_id,
                     worker_id=worker.worker_id,

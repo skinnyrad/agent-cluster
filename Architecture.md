@@ -74,6 +74,7 @@ agent-cluster/
 **Controller:**
 - `ROUTER_MODEL_ID` — Ollama model for the router Agent (default: `gemma4`)
 - `SYNTHESIZER_MODEL_ID` — Ollama model for the synthesizer Agent (default: `gemma4`)
+- `HEALTH_POLL_INTERVAL` — seconds between background worker health probes (default: `30`)
 
 ## workers.yaml format
 
