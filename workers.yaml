@@ -1,40 +1,35 @@
 workers:
-  - worker_id: general-1
-    role: general
+  - worker_id: worker-1
     url: http://localhost:8001
+    model_id: gemma4
     enabled: true
     tags:
       - default
-      - general
 
-  - worker_id: code-1
-    role: code
+  - worker_id: worker-2
     url: http://localhost:8002
+    model_id: gemma4
     enabled: true
     tags:
-      - python
-      - implementation
+      - default
 
-  - worker_id: review-1
-    role: review
+  - worker_id: worker-3
     url: http://localhost:8003
+    model_id: gemma4
     enabled: true
     tags:
-      - critique
-      - quality
+      - default
 
-  - worker_id: test-1
-    role: test
+  - worker_id: worker-4
     url: http://localhost:8004
+    model_id: gemma4
     enabled: true
     tags:
-      - pytest
-      - validation
+      - default
 
-  - worker_id: docs-1
-    role: docs
+  - worker_id: worker-5
     url: http://localhost:8005
+    model_id: gemma4
     enabled: true
     tags:
-      - writing
-      - documentation
+      - default
