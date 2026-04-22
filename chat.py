@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import threading
 import time
 from collections import deque
@@ -51,6 +52,30 @@ console = Console()
 # ---------------------------------------------------------------------------
 
 _SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+_FUN_WAIT_MESSAGES = [
+    "Reticulating splines...",
+    "Herding digital cats...",
+    "Crunching the crunchables...",
+    "Noodling through the logic...",
+    "Consulting the oracle...",
+    "Locating the lost bits...",
+    "Polishing the pixels...",
+    "Calculating the meaning of life...",
+    "Untangling the spaghetti code...",
+    "Shuffling the deck...",
+    "Brewing some fresh data...",
+    "Aligning the stars...",
+    "Harmonizing the sub-processors...",
+    "Warming up the flux capacitor...",
+    "Stretching the memory buffers...",
+    "Skedaddling...",
+    "Schlepping...",
+    "Mulling...",
+    "Frolicking...",
+    "Pondering...",
+    "Ruminating...",
+    "Tinkering...",
+]
 
 
 class LiveStatus:
@@ -129,7 +154,6 @@ def dispatch_prompt(
         "Router decomposing task...",
         "Dispatching to workers...",
         "Waiting on fleet results...",
-        "Synthesizing response...",
     ]
     stop_cycling = threading.Event()
 
@@ -139,6 +163,13 @@ def dispatch_prompt(
             if stop_cycling.wait(3.0):
                 return
             status.update(label)
+        # Once we're waiting on workers, keep things lively with random updates.
+        last_message: Optional[str] = None
+        while not stop_cycling.wait(20.0):
+            candidates = [msg for msg in _FUN_WAIT_MESSAGES if msg != last_message]
+            next_message = random.choice(candidates or _FUN_WAIT_MESSAGES)
+            status.update(next_message)
+            last_message = next_message
 
     cycle_thread = threading.Thread(target=_cycle_stages, daemon=True)
     cycle_thread.start()
