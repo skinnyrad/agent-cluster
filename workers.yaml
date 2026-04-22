@@ -13,23 +13,23 @@ workers:
     tags:
       - default
 
-  - worker_id: worker-3
+  - worker_id: code-analyzer-1
     url: http://localhost:8003
     model_id: gemma4
-    enabled: true
+    enabled: false
     tags:
       - default
 
-  - worker_id: worker-4
+  - worker_id: code-analyzer-2
     url: http://localhost:8004
     model_id: gemma4
-    enabled: true
+    enabled: false
     tags:
       - default
 
   - worker_id: worker-5
     url: http://localhost:8005
     model_id: gemma4
-    enabled: true
+    enabled: false
     tags:
       - default

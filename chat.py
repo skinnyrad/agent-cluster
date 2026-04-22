@@ -121,7 +121,6 @@ def dispatch_prompt(
     augmented_prompt = _build_augmented_prompt(prompt, history)
 
     status.update("Tasking fleet...")
-    console.print()  # blank line before spinner appears
 
     # Start a background thread that cycles through verbose stage labels
     # while we wait for the blocking HTTP call.
