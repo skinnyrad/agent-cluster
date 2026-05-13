@@ -8,7 +8,7 @@ workers:
 
   - worker_id: worker-2
     url: http://localhost:8002
-    model_id: granite4
+    model_id: granite4.1:8b
     enabled: true
     tags:
       - default
