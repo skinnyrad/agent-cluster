@@ -1,6 +1,6 @@
 # agent-cluster
 
-Agent-cluster framework used in the AI For TSCM 2 course. It provides a dynamic agent router where a central controller (backed by an LLM) decomposes tasks on the fly, assigns roles to workers at runtime, and synthesizes their results into a final answer.
+A general-purpose distributed agent cluster for local models. A central controller (backed by an LLM) decomposes tasks on the fly, assigns roles to workers at runtime, and synthesizes their results into a final answer.
 
 ## Overview
 

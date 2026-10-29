@@ -1,7 +1,7 @@
 # GEMINI.md - Project Context: agent-cluster
 
 ## Project Overview
-`agent-cluster` is a dynamic agent orchestration framework designed for the "AI For TSCM 2" course. It implements a **Controller-Worker** architecture where a central controller uses Large Language Models (LLMs) to decompose complex tasks into subtasks, assign them to a fleet of generic, role-agnostic workers, and synthesize their outputs into a final response.
+`agent-cluster` is a general-purpose, dynamic agent orchestration framework for local models. It implements a **Controller-Worker** architecture where a central controller uses Large Language Models (LLMs) to decompose complex tasks into subtasks, assign them to a fleet of generic, role-agnostic workers, and synthesize their outputs into a final response.
 
 ### Core Technologies
 - **Language:** Go 1.26+
