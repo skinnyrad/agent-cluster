@@ -1,31 +1,32 @@
-// Package registry loads the worker fleet from workers.yaml.
+// Package registry loads the optional worker allowlist (workers.yaml). Workers register
+// themselves with the controller; when an allowlist exists, only the enabled workers it
+// lists may register, and its tags are added to theirs.
 package registry
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 
 	"gopkg.in/yaml.v3"
-
-	"github.com/skinnyrad/agent-cluster/internal/schemas"
 )
 
-type fileEntry struct {
+// Entry is one allowed worker.
+type Entry struct {
 	WorkerID string   `yaml:"worker_id"`
-	URL      string   `yaml:"url"`
-	ModelID  string   `yaml:"model_id"`
-	Enabled  *bool    `yaml:"enabled"`
-	Tags     []string `yaml:"tags"`
+	Enabled  *bool    `yaml:"enabled"` // default true
+	Tags     []string `yaml:"tags"`    // added to the tags the worker reports
 }
 
-type file struct {
-	Workers []fileEntry `yaml:"workers"`
-}
+// Allowlist maps worker IDs to their entries. A nil Allowlist allows every worker.
+type Allowlist map[string]Entry
 
-// Load reads path and returns the enabled workers. A missing file yields no workers.
-// The file is re-read on every call, so edits take effect without a restart.
-func Load(path string) ([]schemas.WorkerInfo, error) {
+// Load reads path. A missing file, or an empty path, yields a nil Allowlist.
+func Load(path string) (Allowlist, error) {
+	if path == "" {
+		return nil, nil
+	}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
@@ -34,31 +35,33 @@ func Load(path string) ([]schemas.WorkerInfo, error) {
 		return nil, err
 	}
 
-	var f file
+	var f struct {
+		Workers []Entry `yaml:"workers"`
+	}
 	if err := yaml.Unmarshal(data, &f); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-
-	var workers []schemas.WorkerInfo
+	list := Allowlist{}
 	for _, e := range f.Workers {
-		enabled := e.Enabled == nil || *e.Enabled
-		if !enabled {
-			continue
+		if e.WorkerID == "" {
+			return nil, fmt.Errorf("%s: every worker needs a worker_id", path)
 		}
-		if e.WorkerID == "" || e.URL == "" {
-			return nil, errors.New("workers.yaml: every worker needs worker_id and url")
-		}
-		tags := e.Tags
-		if tags == nil {
-			tags = []string{}
-		}
-		workers = append(workers, schemas.WorkerInfo{
-			WorkerID: e.WorkerID,
-			URL:      e.URL,
-			ModelID:  e.ModelID,
-			Enabled:  true,
-			Tags:     tags,
-		})
+		list[e.WorkerID] = e
 	}
-	return workers, nil
+	return list, nil
+}
+
+// Check reports whether workerID may register, and the extra tags it gets.
+func (a Allowlist) Check(workerID string) (tags []string, err error) {
+	if a == nil {
+		return nil, nil
+	}
+	e, ok := a[workerID]
+	if !ok {
+		return nil, fmt.Errorf("worker %q is not in the allowlist", workerID)
+	}
+	if e.Enabled != nil && !*e.Enabled {
+		return nil, fmt.Errorf("worker %q is disabled in the allowlist", workerID)
+	}
+	return e.Tags, nil
 }

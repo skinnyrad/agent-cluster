@@ -1,22 +1,19 @@
-// Package controller is the fleet's LLM-driven router. For each POST /dispatch a router
-// agent splits the prompt into per-worker subtasks (each with its own system prompt), the
-// controller sends them to live workers, and a synthesizer agent merges the results.
+// Package controller is the cluster's LLM-driven coordinator. For each job, a router agent
+// breaks the prompt into subtasks with dependencies, the controller schedules them onto
+// registered workers as slots free up, a reviewer agent may ask for another round, and a
+// synthesizer agent merges the results. Progress streams to clients as events, and jobs
+// are stored in SQLite.
 package controller
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
-	"strings"
+	"strconv"
 	"sync"
 	"time"
-
-	"github.com/google/uuid"
 
 	"github.com/skinnyrad/agent-cluster/internal/agent"
 	"github.com/skinnyrad/agent-cluster/internal/httputil"
@@ -24,350 +21,307 @@ import (
 	"github.com/skinnyrad/agent-cluster/internal/schemas"
 )
 
+// Defaults for Config fields left zero.
 const (
-	probeTimeout = 5 * time.Second
-	// DefaultWorkerTimeout is how long a worker gets to answer one subtask.
 	DefaultWorkerTimeout = 5 * time.Minute
+	DefaultHeartbeatTTL  = 20 * time.Second
+	DefaultMaxRounds     = 2
+	DefaultHistoryTurns  = 6
 )
 
 // Config configures a controller.
 type Config struct {
-	WorkersPath      string        // path to workers.yaml
-	RouterModel      string        // Ollama model for task decomposition
-	SynthesizerModel string        // Ollama model for result merging
-	PollInterval     time.Duration // time between worker health checks
-	WorkerTimeout    time.Duration // per-subtask limit; zero means DefaultWorkerTimeout
-	AgentClient      *agent.Client // nil uses the default Ollama client
+	Token            string         // cluster token; required on requests when set
+	StorePath        string         // SQLite file for jobs and events
+	AllowlistPath    string         // optional workers.yaml
+	RouterModel      string         // Ollama model for planning and review
+	SynthesizerModel string         // Ollama model for the final answer
+	Options          *agent.Options // model parameters for the controller's own agents
+	WorkerTimeout    time.Duration  // per-subtask limit
+	HeartbeatTTL     time.Duration  // a worker silent this long is considered gone
+	MaxRounds        int            // 1 disables review; each extra round allows one review
+	HistoryTurns     int            // earlier exchanges shown to the router; zero means the default, negative none
+	AgentClient      *agent.Client  // nil uses the default Ollama client
 }
 
-type controller struct {
-	workersPath      string
-	routerModel      string
-	synthesizerModel string
-	agentClient      *agent.Client
-	probeClient      *http.Client
-	dispatchClient   *http.Client
+// Controller coordinates jobs across registered workers.
+type Controller struct {
+	cfg            Config
+	store          *store
+	pool           *pool
+	dispatchClient *http.Client
 
-	mu   sync.RWMutex
-	live map[string]bool // worker_id -> passed its last health probe
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	mu   sync.Mutex
+	jobs map[string]*jobRun // running jobs
 }
 
-// New probes the fleet once, starts background health polling until ctx is done, and
-// returns the controller's HTTP handler.
-func New(ctx context.Context, cfg Config) http.Handler {
+// New opens the store and returns a controller. Call Close when done.
+func New(cfg Config) (*Controller, error) {
 	if cfg.WorkerTimeout <= 0 {
 		cfg.WorkerTimeout = DefaultWorkerTimeout
 	}
-	c := &controller{
-		workersPath:      cfg.WorkersPath,
-		routerModel:      cfg.RouterModel,
-		synthesizerModel: cfg.SynthesizerModel,
-		agentClient:      cfg.AgentClient,
-		probeClient:      &http.Client{Timeout: probeTimeout},
-		dispatchClient:   &http.Client{Timeout: cfg.WorkerTimeout},
-		live:             map[string]bool{},
+	if cfg.HeartbeatTTL <= 0 {
+		cfg.HeartbeatTTL = DefaultHeartbeatTTL
 	}
-	c.refreshWorkerStatus(ctx)
-	go c.pollHealth(ctx, cfg.PollInterval)
-	return c.routes()
+	if cfg.MaxRounds <= 0 {
+		cfg.MaxRounds = DefaultMaxRounds
+	}
+	switch {
+	case cfg.HistoryTurns == 0:
+		cfg.HistoryTurns = DefaultHistoryTurns
+	case cfg.HistoryTurns < 0:
+		cfg.HistoryTurns = 0
+	}
+	if cfg.StorePath == "" {
+		cfg.StorePath = "agent-cluster.db"
+	}
+	st, err := openStore(cfg.StorePath)
+	if err != nil {
+		return nil, fmt.Errorf("opening %s: %w", cfg.StorePath, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Controller{
+		cfg:            cfg,
+		store:          st,
+		pool:           newPool(cfg.HeartbeatTTL),
+		dispatchClient: &http.Client{Timeout: cfg.WorkerTimeout},
+		ctx:            ctx,
+		cancel:         cancel,
+		jobs:           map[string]*jobRun{},
+	}, nil
 }
 
-func (c *controller) routes() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /workers", c.listWorkers)
-	mux.HandleFunc("POST /dispatch", c.dispatch)
-	return mux
-}
-
-func (c *controller) isAlive(workerID string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.live[workerID]
-}
-
-func (c *controller) markDead(workerID string) {
+// Close cancels running jobs, waits for them to record their state, and closes the store.
+func (c *Controller) Close() error {
+	c.cancel()
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.live[workerID] = false
+	running := make([]*jobRun, 0, len(c.jobs))
+	for _, jr := range c.jobs {
+		running = append(running, jr)
+	}
+	c.mu.Unlock()
+	for _, jr := range running {
+		<-jr.done
+	}
+	return c.store.Close()
 }
 
-// availableWorkers returns enabled workers that passed their last health probe.
-func (c *controller) availableWorkers() ([]schemas.WorkerInfo, error) {
-	workers, err := registry.Load(c.workersPath)
-	if err != nil {
-		return nil, err
-	}
-	var alive []schemas.WorkerInfo
-	for _, w := range workers {
-		if c.isAlive(w.WorkerID) {
-			alive = append(alive, w)
-		}
-	}
-	return alive, nil
+// Handler returns the controller's HTTP API.
+func (c *Controller) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		httputil.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "live_workers": len(c.pool.live())})
+	})
+	mux.HandleFunc("GET /workers", c.listWorkers)
+	mux.HandleFunc("POST /workers/register", c.registerWorker)
+	mux.HandleFunc("DELETE /workers/{id}", c.deregisterWorker)
+	mux.HandleFunc("POST /jobs", c.createJob)
+	mux.HandleFunc("GET /jobs", c.listJobs)
+	mux.HandleFunc("GET /jobs/{id}", c.getJob)
+	mux.HandleFunc("DELETE /jobs/{id}", c.cancelJob)
+	mux.HandleFunc("GET /jobs/{id}/events", c.jobEvents)
+	mux.HandleFunc("POST /dispatch", c.dispatch)
+	return httputil.RequireToken(c.cfg.Token, mux)
 }
 
-// probeWorker reports whether the worker is reachable, says ok, isn't offline, and
-// reports the worker_id the registry expects.
-func (c *controller) probeWorker(ctx context.Context, w schemas.WorkerInfo) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, w.URL+"/health", nil)
-	if err != nil {
-		return false
-	}
-	resp, err := c.probeClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-	var h schemas.HealthResponse
-	if err := json.NewDecoder(resp.Body).Decode(&h); err != nil || h.Validate() != nil {
-		return false
-	}
-	return h.OK && h.WorkerID == w.WorkerID && h.Status != schemas.StatusOffline
+func (c *Controller) listWorkers(w http.ResponseWriter, r *http.Request) {
+	httputil.WriteJSON(w, http.StatusOK, schemas.WorkersResponse{Workers: c.pool.list()})
 }
 
-// refreshWorkerStatus probes all enabled workers concurrently and replaces the live set.
-func (c *controller) refreshWorkerStatus(ctx context.Context) {
-	workers, err := registry.Load(c.workersPath)
-	if err != nil {
-		log.Printf("loading %s: %v", c.workersPath, err)
+func (c *Controller) registerWorker(w http.ResponseWriter, r *http.Request) {
+	var reg schemas.WorkerRegistration
+	if !httputil.ReadJSON(w, r, &reg) {
 		return
 	}
-
-	results := make([]bool, len(workers))
-	var wg sync.WaitGroup
-	for i, w := range workers {
-		wg.Go(func() { results[i] = c.probeWorker(ctx, w) })
-	}
-	wg.Wait()
-
-	live := make(map[string]bool, len(workers))
-	for i, w := range workers {
-		live[w.WorkerID] = results[i]
-	}
-	c.mu.Lock()
-	c.live = live
-	c.mu.Unlock()
-}
-
-func (c *controller) pollHealth(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			c.refreshWorkerStatus(ctx)
-		}
-	}
-}
-
-func (c *controller) listWorkers(w http.ResponseWriter, r *http.Request) {
-	workers, err := registry.Load(c.workersPath)
+	allow, err := registry.Load(c.cfg.AllowlistPath)
 	if err != nil {
 		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	resp := schemas.WorkersResponse{Workers: []schemas.WorkerStatusEntry{}}
-	for _, wk := range workers {
-		resp.Workers = append(resp.Workers, schemas.WorkerStatusEntry{WorkerInfo: wk, Alive: c.isAlive(wk.WorkerID)})
+	extraTags, err := allow.Check(reg.WorkerID)
+	if err != nil {
+		httputil.WriteError(w, http.StatusForbidden, err.Error())
+		return
 	}
-	httputil.WriteJSON(w, http.StatusOK, resp)
+	reg.Tags = dedupe(append(reg.Tags, extraTags...))
+	c.pool.register(reg)
+	httputil.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (c *controller) dispatch(w http.ResponseWriter, r *http.Request) {
-	var req schemas.DispatchRequest
+func (c *Controller) deregisterWorker(w http.ResponseWriter, r *http.Request) {
+	c.pool.remove(r.PathValue("id"))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (c *Controller) createJob(w http.ResponseWriter, r *http.Request) {
+	var req schemas.JobRequest
 	if !httputil.ReadJSON(w, r, &req) {
 		return
 	}
-
-	workers, err := c.availableWorkers()
+	jr, err := c.startJob(req)
 	if err != nil {
 		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if len(workers) == 0 {
-		httputil.WriteError(w, http.StatusServiceUnavailable, "No live workers available")
-		return
-	}
-
-	requestID := uuid.NewString()
-	ctx := r.Context()
-
-	// Router agent: decompose the user prompt into per-worker subtasks.
-	var desc strings.Builder
-	for _, wk := range workers {
-		model := wk.ModelID
-		if model == "" {
-			model = "unknown"
-		}
-		fmt.Fprintf(&desc, "- worker_id: %s, model: %s, tags: %v\n", wk.WorkerID, model, wk.Tags)
-	}
-
-	router := &agent.Agent{
-		Model: c.routerModel,
-		Instructions: []string{
-			"You are a task router for a distributed agent system.",
-			"Given a user task and a list of available worker agents, decompose the task into focused subtasks.",
-			"Assign each subtask to a specific worker. Use as many or as few workers as the task requires.",
-			"For each subtask, write a system_prompt that defines that worker's role/persona, and a task_prompt with the specific work to do.",
-			"You MUST respond with ONLY a valid JSON array and nothing else — no explanation, no markdown fences.",
-			`Format: [{"worker_id": "...", "system_prompt": "...", "task_prompt": "..."}, ...]`,
-		},
-		Client: c.agentClient,
-	}
-	routerPrompt := fmt.Sprintf(
-		"Task: %s\n\nAvailable workers:\n%s\nDecompose this task into subtasks. Return JSON only.",
-		req.Prompt, desc.String(),
-	)
-	routerResp, err := router.Run(ctx, routerPrompt)
-	if err != nil {
-		httputil.WriteError(w, http.StatusInternalServerError, "router agent: "+err.Error())
-		return
-	}
-	subtasks := parseRouterPlan(routerResp.Content, workers)
-
-	// Fill any empty task prompts (the fallback case) with the original prompt.
-	for i := range subtasks {
-		if subtasks[i].TaskPrompt == "" {
-			subtasks[i].TaskPrompt = req.Prompt
-		}
-	}
-
-	workerMap := make(map[string]schemas.WorkerInfo, len(workers))
-	for _, wk := range workers {
-		workerMap[wk.WorkerID] = wk
-	}
-
-	// Dispatch all subtasks concurrently. Each goroutine writes only its own slot, so
-	// results stay in plan order.
-	results := make([]schemas.AgentResult, len(subtasks))
-	var wg sync.WaitGroup
-	for i, st := range subtasks {
-		wk, ok := workerMap[st.WorkerID]
-		if !ok {
-			results[i] = failedResult(requestID, st.WorkerID,
-				fmt.Sprintf("Worker '%s' not found in registry", st.WorkerID))
-			continue
-		}
-
-		task := schemas.AgentTask{
-			TaskID:       uuid.NewString(),
-			SystemPrompt: st.SystemPrompt,
-			Prompt:       st.TaskPrompt,
-			Context:      req.Context,
-			SessionID:    req.SessionID,
-			UserID:       req.UserID,
-		}
-		wg.Go(func() {
-			result, err := c.runOnWorker(ctx, wk, task)
-			if err != nil {
-				// A worker that timed out is slow, not down, and a cancelled dispatch says
-				// nothing about the worker. Anything else (refused connection, bad status)
-				// marks it dead so it's excluded until its next successful health probe.
-				if !isTimeout(err) && ctx.Err() == nil {
-					c.markDead(wk.WorkerID)
-				}
-				results[i] = failedResult(task.TaskID, wk.WorkerID, err.Error())
-				return
-			}
-			results[i] = *result
-		})
-	}
-	wg.Wait()
-
-	// Synthesizer agent: merge all worker results into a final answer.
-	synthesizer := &agent.Agent{
-		Model: c.synthesizerModel,
-		Instructions: []string{
-			"You are a synthesis agent.",
-			"You receive the results from multiple specialist worker agents and combine them into a single coherent final answer.",
-			"Be concise and structured. Directly address the original task.",
-		},
-		Markdown: true,
-		Client:   c.agentClient,
-	}
-	sections := make([]string, 0, len(results))
-	for _, res := range results {
-		body := res.Content
-		if !res.Success {
-			body = "ERROR: " + deref(res.Error, "")
-		}
-		sections = append(sections, fmt.Sprintf("### Worker %s\n%s", res.WorkerID, body))
-	}
-	synthResp, err := synthesizer.Run(ctx, fmt.Sprintf(
-		"Original task: %s\n\nWorker results:\n%s\n\nSynthesize a final answer.",
-		req.Prompt, strings.Join(sections, "\n\n"),
-	))
-	if err != nil {
-		httputil.WriteError(w, http.StatusInternalServerError, "synthesizer agent: "+err.Error())
-		return
-	}
-
-	httputil.WriteJSON(w, http.StatusOK, schemas.DispatchResponse{
-		RequestID:      requestID,
-		OriginalPrompt: req.Prompt,
-		Subtasks:       subtasks,
-		Results:        results,
-		Synthesis:      synthResp.Content,
-	})
+	httputil.WriteJSON(w, http.StatusAccepted, schemas.JobCreated{JobID: jr.job.ID, SessionID: jr.job.SessionID})
 }
 
-// runOnWorker posts task to the worker's /run endpoint.
-func (c *controller) runOnWorker(ctx context.Context, wk schemas.WorkerInfo, task schemas.AgentTask) (*schemas.AgentResult, error) {
-	body, err := json.Marshal(task)
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, wk.URL+"/run", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.dispatchClient.Do(req)
-	if isTimeout(err) {
-		return nil, fmt.Errorf("worker %s did not finish within %s: %w", wk.WorkerID, c.dispatchClient.Timeout, err)
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("worker %s returned HTTP %d", wk.WorkerID, resp.StatusCode)
-	}
-
-	var result schemas.AgentResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decoding result from %s: %w", wk.WorkerID, err)
-	}
-	if result.Metrics == nil {
-		result.Metrics = map[string]any{}
-	}
-	return &result, nil
+func (c *Controller) running(id string) *jobRun {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.jobs[id]
 }
 
-// isTimeout reports whether err is a deadline or client timeout.
-func isTimeout(err error) bool {
-	if err == nil {
-		return false
+func (c *Controller) listJobs(w http.ResponseWriter, r *http.Request) {
+	limit := 20
+	if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 && n <= 200 {
+		limit = n
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
+	jobs, err := c.store.jobs(r.URL.Query().Get("session_id"), limit)
+	if err != nil {
+		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, schemas.JobsResponse{Jobs: jobs})
+}
+
+func (c *Controller) getJob(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if jr := c.running(id); jr != nil {
+		httputil.WriteJSON(w, http.StatusOK, jr.snapshot())
+		return
+	}
+	j, err := c.store.job(id)
+	switch {
+	case err != nil:
+		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+	case j == nil:
+		httputil.WriteError(w, http.StatusNotFound, "job not found")
+	default:
+		httputil.WriteJSON(w, http.StatusOK, j)
+	}
+}
+
+func (c *Controller) cancelJob(w http.ResponseWriter, r *http.Request) {
+	jr := c.running(r.PathValue("id"))
+	if jr == nil {
+		httputil.WriteError(w, http.StatusNotFound, "no running job with that id")
+		return
+	}
+	jr.cancel()
+	<-jr.done
+	httputil.WriteJSON(w, http.StatusOK, jr.snapshot())
+}
+
+// jobEvents streams a job's events as server-sent events: everything so far, then live
+// events until the job finishes.
+func (c *Controller) jobEvents(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var past []schemas.Event
+	var live chan schemas.Event
+	if jr := c.running(id); jr != nil {
+		past, live = jr.subscribe()
+		if live != nil {
+			defer jr.unsubscribe(live)
+		}
+	} else {
+		j, err := c.store.job(id)
+		if err == nil && j == nil {
+			httputil.WriteError(w, http.StatusNotFound, "job not found")
+			return
+		}
+		if err == nil {
+			past, err = c.store.events(id)
+		}
+		if err != nil {
+			httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	write := func(e schemas.Event) bool {
+		data, _ := json.Marshal(e)
+		if _, err := fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", e.Seq, e.Type, data); err != nil {
+			return false
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
 		return true
 	}
-	var ne net.Error
-	return errors.As(err, &ne) && ne.Timeout()
+	for _, e := range past {
+		if !write(e) {
+			return
+		}
+	}
+	if live == nil {
+		return
+	}
+
+	keepAlive := time.NewTicker(15 * time.Second)
+	defer keepAlive.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case e, ok := <-live:
+			if !ok || !write(e) {
+				return
+			}
+		case <-keepAlive.C:
+			if _, err := fmt.Fprint(w, ": keep-alive\n\n"); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}
 }
 
-func failedResult(taskID, workerID, msg string) schemas.AgentResult {
-	return schemas.AgentResult{
-		TaskID:   taskID,
-		WorkerID: workerID,
-		Success:  false,
-		Metrics:  map[string]any{},
-		Error:    &msg,
+// dispatch runs a job and waits for it to finish. If the client goes away first, the job
+// is cancelled.
+func (c *Controller) dispatch(w http.ResponseWriter, r *http.Request) {
+	var req schemas.JobRequest
+	if !httputil.ReadJSON(w, r, &req) {
+		return
 	}
+	jr, err := c.startJob(req)
+	if err != nil {
+		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	select {
+	case <-jr.done:
+	case <-r.Context().Done():
+		jr.cancel()
+		<-jr.done
+		return
+	}
+
+	j := jr.snapshot()
+	if j.Status == schemas.JobFailed && j.Error == "No live workers available" {
+		httputil.WriteError(w, http.StatusServiceUnavailable, j.Error)
+		return
+	}
+	if j.Status != schemas.JobDone {
+		log.Printf("job %s %s: %s", j.ID, j.Status, j.Error)
+	}
+	httputil.WriteJSON(w, http.StatusOK, schemas.DispatchResponse{
+		RequestID:      j.ID,
+		SessionID:      j.SessionID,
+		OriginalPrompt: j.Prompt,
+		Status:         j.Status,
+		Subtasks:       j.Subtasks,
+		Results:        j.Results,
+		Synthesis:      j.Synthesis,
+		Error:          j.Error,
+	})
 }

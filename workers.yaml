@@ -1,15 +1,13 @@
+# Optional worker allowlist. Workers register themselves with the controller; when this
+# file exists, only the enabled workers listed here may register. Tags listed here are
+# added to the tags each worker reports. Delete the file to allow any worker that has the
+# cluster token.
 workers:
   - worker_id: worker-1
-    url: http://localhost:8001
-    model_id: gemma4
-    enabled: true
     tags:
       - default
 
   - worker_id: worker-2
-    url: http://localhost:8002
-    model_id: gemma4
-    enabled: true
     tags:
       - default
 
@@ -17,29 +15,6 @@ workers:
   # two models swap in and out of memory instead of running in parallel. Enable it when
   # it has its own Ollama host or enough memory.
   - worker_id: granite-1
-    url: http://localhost:8006
-    model_id: granite4.2
-    enabled: false
-    tags:
-      - default
-
-  - worker_id: code-analyzer-1
-    url: http://localhost:8003
-    model_id: gemma4
-    enabled: false
-    tags:
-      - default
-
-  - worker_id: code-analyzer-2
-    url: http://localhost:8004
-    model_id: gemma4
-    enabled: false
-    tags:
-      - default
-
-  - worker_id: worker-5
-    url: http://localhost:8005
-    model_id: gemma4
     enabled: false
     tags:
       - default
