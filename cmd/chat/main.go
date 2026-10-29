@@ -1,6 +1,6 @@
 // Command chat is an interactive terminal client for the agent-cluster controller.
 //
-//	go run ./cmd/chat [--url http://localhost:8100]
+//	go run ./cmd/chat [--url http://localhost:8100] [--timeout 900]
 //
 // Slash commands:
 //
@@ -14,8 +14,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"net"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/peterh/liner"
@@ -26,7 +29,13 @@ import (
 func main() {
 	defaultURL := httputil.Getenv("CONTROLLER_URL", "http://localhost:8100")
 	url := flag.String("url", defaultURL, "controller base URL")
+	defaultTimeout, err := strconv.Atoi(httputil.Getenv("CHAT_TIMEOUT", "900"))
+	if err != nil || defaultTimeout <= 0 {
+		log.Fatal("CHAT_TIMEOUT must be a positive number of seconds")
+	}
+	timeoutSeconds := flag.Int("timeout", defaultTimeout, "seconds to wait for each dispatch")
 	flag.Parse()
+	timeout := time.Duration(*timeoutSeconds) * time.Second
 	baseURL := strings.TrimRight(*url, "/")
 	initMarkdownStyle()
 
@@ -79,7 +88,7 @@ func main() {
 
 		// Dispatch to fleet
 		status := startStatus("Tasking fleet...")
-		data, err := dispatchPrompt(baseURL, input, &hist, status)
+		data, err := dispatchPrompt(baseURL, input, timeout, &hist, status)
 		status.Stop()
 		if err != nil {
 			printDispatchError(baseURL, err)

@@ -50,7 +50,7 @@ This project implements a **dynamic agent router** pattern in Go, using Ollama f
 - **Entry points** (`cmd/controller`, `cmd/worker`, `cmd/chat`): Only parse flags and environment variables; logic lives in `internal/`.
 
 ### Worker health tracking
-The controller probes every enabled worker's `GET /health` at startup (before serving any requests) and again on a background timer (`HEALTH_POLL_INTERVAL`, default 30 s). Only workers that return `ok: true`, a non-`offline` status, and a matching `worker_id` are considered live. The `/dispatch` endpoint only routes tasks to live workers. If a dispatch call to a worker fails mid-flight, that worker is immediately marked dead and excluded from subsequent requests until the next successful health probe.
+The controller probes every enabled worker's `GET /health` at startup (before serving any requests) and again on a background timer (`HEALTH_POLL_INTERVAL`, default 30 s). Only workers that return `ok: true`, a non-`offline` status, and a matching `worker_id` are considered live. The `/dispatch` endpoint only routes tasks to live workers. If a dispatch call to a worker fails mid-flight with a connection error or a non-2xx status, that worker is immediately marked dead and excluded from subsequent requests until the next successful health probe. A worker that exceeds `WORKER_TIMEOUT` gets a failed result for that subtask but stays live.
 
 `GET /workers` returns each worker's current `alive` status alongside its registry metadata.
 
@@ -60,7 +60,7 @@ The controller probes every enabled worker's `GET /health` at startup (before se
 3. Controller's **router agent** receives only the currently live workers and outputs a JSON plan: `[{worker_id, system_prompt, task_prompt}, ...]`.
 4. Controller dispatches each subtask to its assigned worker via `POST /run`, with the dynamic `system_prompt` embedded in the `AgentTask`.
 5. Workers call their Ollama model with the provided `system_prompt` and execute the task.
-6. If a worker fails mid-dispatch it is immediately marked dead.
+6. If a worker is unreachable or returns an error status it is immediately marked dead; a timeout fails the subtask but leaves the worker live.
 7. Controller's **synthesizer agent** combines all results into a final answer.
 8. `DispatchResponse` returns `request_id`, `subtasks` plan, raw `results`, and `synthesis`.
 
@@ -72,9 +72,9 @@ The controller probes every enabled worker's `GET /health` at startup (before se
 - **Pass `context.Context`** through network calls so a dropped client cancels in-flight model calls.
 - **Environment variables:**
   - Workers: `WORKER_ID`, `MODEL_ID`, `WORKER_STATUS`
-  - Controller: `ROUTER_MODEL_ID`, `SYNTHESIZER_MODEL_ID`, `HEALTH_POLL_INTERVAL` (default: `30`), `WORKERS_FILE`
+  - Controller: `ROUTER_MODEL_ID`, `SYNTHESIZER_MODEL_ID`, `HEALTH_POLL_INTERVAL` (default: `30`), `WORKER_TIMEOUT` (default: `300`), `WORKERS_FILE`
   - All services: `OLLAMA_HOST`
-  - Chat: `CONTROLLER_URL`, `GLAMOUR_STYLE`
+  - Chat: `CONTROLLER_URL`, `CHAT_TIMEOUT` (default: `900`), `GLAMOUR_STYLE`
 - **Router fallback:** If the router agent returns unparseable JSON, the controller broadcasts the original prompt to all workers with a generic system prompt.
 - **Extending the worker pool:** Add entries to `workers.yaml` and start the corresponding `cmd/worker` processes. No code changes needed.
 

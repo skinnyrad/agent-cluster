@@ -8,8 +8,18 @@ workers:
 
   - worker_id: worker-2
     url: http://localhost:8002
-    model_id: granite4.2
+    model_id: gemma4
     enabled: true
+    tags:
+      - default
+
+  # Disabled: on a 32 GB machine granite4.2 can't stay loaded alongside gemma4, so the
+  # two models swap in and out of memory instead of running in parallel. Enable it when
+  # it has its own Ollama host or enough memory.
+  - worker_id: granite-1
+    url: http://localhost:8006
+    model_id: granite4.2
+    enabled: false
     tags:
       - default
 

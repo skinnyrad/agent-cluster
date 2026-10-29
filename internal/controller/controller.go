@@ -7,8 +7,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -23,8 +25,9 @@ import (
 )
 
 const (
-	probeTimeout    = 5 * time.Second
-	dispatchTimeout = 120 * time.Second
+	probeTimeout = 5 * time.Second
+	// DefaultWorkerTimeout is how long a worker gets to answer one subtask.
+	DefaultWorkerTimeout = 5 * time.Minute
 )
 
 // Config configures a controller.
@@ -33,6 +36,7 @@ type Config struct {
 	RouterModel      string        // Ollama model for task decomposition
 	SynthesizerModel string        // Ollama model for result merging
 	PollInterval     time.Duration // time between worker health checks
+	WorkerTimeout    time.Duration // per-subtask limit; zero means DefaultWorkerTimeout
 	AgentClient      *agent.Client // nil uses the default Ollama client
 }
 
@@ -51,13 +55,16 @@ type controller struct {
 // New probes the fleet once, starts background health polling until ctx is done, and
 // returns the controller's HTTP handler.
 func New(ctx context.Context, cfg Config) http.Handler {
+	if cfg.WorkerTimeout <= 0 {
+		cfg.WorkerTimeout = DefaultWorkerTimeout
+	}
 	c := &controller{
 		workersPath:      cfg.WorkersPath,
 		routerModel:      cfg.RouterModel,
 		synthesizerModel: cfg.SynthesizerModel,
 		agentClient:      cfg.AgentClient,
 		probeClient:      &http.Client{Timeout: probeTimeout},
-		dispatchClient:   &http.Client{Timeout: dispatchTimeout},
+		dispatchClient:   &http.Client{Timeout: cfg.WorkerTimeout},
 		live:             map[string]bool{},
 	}
 	c.refreshWorkerStatus(ctx)
@@ -258,8 +265,12 @@ func (c *controller) dispatch(w http.ResponseWriter, r *http.Request) {
 		wg.Go(func() {
 			result, err := c.runOnWorker(ctx, wk, task)
 			if err != nil {
-				// Mark the worker dead immediately so it's excluded from the next dispatch.
-				c.markDead(wk.WorkerID)
+				// A worker that timed out is slow, not down, and a cancelled dispatch says
+				// nothing about the worker. Anything else (refused connection, bad status)
+				// marks it dead so it's excluded until its next successful health probe.
+				if !isTimeout(err) && ctx.Err() == nil {
+					c.markDead(wk.WorkerID)
+				}
 				results[i] = failedResult(task.TaskID, wk.WorkerID, err.Error())
 				return
 			}
@@ -318,6 +329,9 @@ func (c *controller) runOnWorker(ctx context.Context, wk schemas.WorkerInfo, tas
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.dispatchClient.Do(req)
+	if isTimeout(err) {
+		return nil, fmt.Errorf("worker %s did not finish within %s: %w", wk.WorkerID, c.dispatchClient.Timeout, err)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -334,6 +348,18 @@ func (c *controller) runOnWorker(ctx context.Context, wk schemas.WorkerInfo, tas
 		result.Metrics = map[string]any{}
 	}
 	return &result, nil
+}
+
+// isTimeout reports whether err is a deadline or client timeout.
+func isTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 func failedResult(taskID, workerID, msg string) schemas.AgentResult {

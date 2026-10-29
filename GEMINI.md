@@ -119,9 +119,11 @@ Slash commands available in the chat client:
 | `ROUTER_MODEL_ID` | `gemma4` | Ollama model for task decomposition. |
 | `SYNTHESIZER_MODEL_ID` | `gemma4` | Ollama model for result merging. |
 | `HEALTH_POLL_INTERVAL`| `30` | Seconds between worker health checks. |
+| `WORKER_TIMEOUT` | `300` | Seconds each worker gets per subtask. Timed-out workers stay live. |
 | `WORKERS_FILE` | `workers.yaml` | Registry path used by the controller. |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server used by the controller and workers. |
 | `CONTROLLER_URL` | `http://localhost:8100` | Controller base URL used by the chat client. |
+| `CHAT_TIMEOUT` | `900` | Seconds the chat client waits for each dispatch. |
 | `GLAMOUR_STYLE` | `dark` | Markdown style for the chat client (`light` for light terminals). |
 
 ---

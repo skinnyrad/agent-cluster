@@ -50,6 +50,8 @@ For detailed architecture and design decisions, see `Architecture.md`.
 
    Edit `workers.yaml` to list your workers with `worker_id`, `url`, `model_id`, `enabled`, and `tags`. No `role` needed.
 
+   The default fleet runs both enabled workers on `gemma4`, so Ollama keeps a single model loaded and can serve them in parallel. A `granite4.2` worker is listed but disabled: on a 32 GB machine it can't stay loaded next to `gemma4`, and the two models end up swapping instead of running together.
+
 4. **Run workers** (start as many as you want — they are all generic)
 
    ```bash
@@ -65,7 +67,7 @@ For detailed architecture and design decisions, see `Architecture.md`.
    ROUTER_MODEL_ID=gemma4 SYNTHESIZER_MODEL_ID=gemma4 go run ./cmd/controller --port 8100
    ```
 
-Every service takes `--host` (default `0.0.0.0`) and `--port`. The controller also takes `--workers` to point at a different registry file. Set `OLLAMA_HOST` if Ollama isn't on `http://localhost:11434`.
+Every service takes `--host` (default `0.0.0.0`) and `--port`. The controller also takes `--workers` to point at a different registry file, and `WORKER_TIMEOUT` sets how many seconds each worker gets per subtask (default 300). A worker that times out fails that subtask but stays in the pool. Set `OLLAMA_HOST` if Ollama isn't on `http://localhost:11434`.
 
 ## Example usage
 
@@ -97,6 +99,8 @@ Every service takes `--host` (default `0.0.0.0`) and `--port`. The controller al
   - **6-turn rolling context** — the last 6 user+assistant exchanges are included automatically as conversation history on each dispatch
   - **Verbose status** — a live spinner cycles through *Tasking fleet → Router decomposing → Dispatching to workers → Waiting on fleet results* while the request is in flight
   - **Slash commands** — `/workers`, `/clear`, `/help`, `/quit`
+
+  The client waits up to 15 minutes for each dispatch; change that with `--timeout <seconds>` or `CHAT_TIMEOUT`.
 
   Markdown is rendered with a dark-background style. On a light terminal, run it with `GLAMOUR_STYLE=light`.
 

@@ -76,7 +76,7 @@ func fetchWorkers(baseURL string) (*schemas.WorkersResponse, error) {
 
 // dispatchPrompt sends prompt plus conversation history to /dispatch, cycling the status
 // line through the pipeline stages while it waits.
-func dispatchPrompt(baseURL, prompt string, hist *history, status *liveStatus) (*schemas.DispatchResponse, error) {
+func dispatchPrompt(baseURL, prompt string, timeout time.Duration, hist *history, status *liveStatus) (*schemas.DispatchResponse, error) {
 	status.Update("Tasking fleet...")
 
 	stop := make(chan struct{})
@@ -94,7 +94,7 @@ func dispatchPrompt(baseURL, prompt string, hist *history, status *liveStatus) (
 	if err != nil {
 		return nil, err
 	}
-	client := &http.Client{Timeout: 300 * time.Second}
+	client := &http.Client{Timeout: timeout}
 	resp, err := client.Post(baseURL+"/dispatch", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return nil, err

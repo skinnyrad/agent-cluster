@@ -25,6 +25,10 @@ type fakeOllama struct {
 	// barrier, if set, makes each worker call wait until this many worker calls are in
 	// flight at once, or give up after a short timeout and reply "TIMED OUT".
 	barrier int
+	// slowModel, if set, makes worker calls for that model take slowDelay (or until the
+	// caller gives up).
+	slowModel string
+	slowDelay time.Duration
 
 	mu          sync.Mutex
 	workerCalls []agent.ChatRequest
@@ -39,6 +43,14 @@ func (f *fakeOllama) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	system, user := req.Messages[0].Content, req.Messages[len(req.Messages)-1].Content
+
+	if f.slowModel != "" && req.Model == f.slowModel {
+		select {
+		case <-time.After(f.slowDelay):
+		case <-r.Context().Done():
+			return
+		}
+	}
 
 	var reply string
 	f.mu.Lock()
@@ -93,6 +105,11 @@ func startCluster(t *testing.T, routerReply string, workerIDs ...string) *cluste
 
 func startClusterWith(t *testing.T, ollama *fakeOllama, workerIDs ...string) *cluster {
 	t.Helper()
+	return startClusterConfig(t, ollama, func(*Config) {}, workerIDs...)
+}
+
+func startClusterConfig(t *testing.T, ollama *fakeOllama, configure func(*Config), workerIDs ...string) *cluster {
+	t.Helper()
 	ollamaSrv := httptest.NewServer(ollama)
 	t.Cleanup(ollamaSrv.Close)
 	client := &agent.Client{BaseURL: ollamaSrv.URL, HTTP: ollamaSrv.Client()}
@@ -115,13 +132,15 @@ func startClusterWith(t *testing.T, ollama *fakeOllama, workerIDs ...string) *cl
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	ctrl := httptest.NewServer(New(ctx, Config{
+	cfg := Config{
 		WorkersPath:      path,
 		RouterModel:      "router-model",
 		SynthesizerModel: "synth-model",
 		PollInterval:     time.Hour,
 		AgentClient:      client,
-	}))
+	}
+	configure(&cfg)
+	ctrl := httptest.NewServer(New(ctx, cfg))
 	t.Cleanup(ctrl.Close)
 
 	return &cluster{ollama: ollama, controller: ctrl, workers: workers}
@@ -258,6 +277,28 @@ func TestDeadWorkersAreExcluded(t *testing.T) {
 		if r.WorkerID != "w1" || !r.Success {
 			t.Errorf("result %+v, want success from w1", r)
 		}
+	}
+}
+
+func TestSlowWorkersTimeOutButStayAlive(t *testing.T) {
+	plan := `[{"worker_id": "w1", "system_prompt": "S", "task_prompt": "fast"},
+	          {"worker_id": "w2", "system_prompt": "S", "task_prompt": "slow"}]`
+	ollama := &fakeOllama{routerReply: plan, slowModel: "model-w2", slowDelay: 5 * time.Second}
+	c := startClusterConfig(t, ollama, func(cfg *Config) { cfg.WorkerTimeout = 300 * time.Millisecond }, "w1", "w2")
+
+	status, resp := c.dispatch(t, "one fast, one slow")
+	if status != http.StatusOK {
+		t.Fatalf("dispatch status = %d", status)
+	}
+	if !resp.Results[0].Success {
+		t.Errorf("fast worker failed: %+v", resp.Results[0])
+	}
+	slow := resp.Results[1]
+	if slow.Success || slow.Error == nil || !strings.Contains(*slow.Error, "did not finish within 300ms") {
+		t.Fatalf("slow worker result = %+v, want a timeout error", slow)
+	}
+	if alive := c.aliveMap(t); !alive["w1"] || !alive["w2"] {
+		t.Fatalf("alive = %v, want both workers still alive after a timeout", alive)
 	}
 }
 

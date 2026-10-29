@@ -12,11 +12,11 @@ A typical request flow:
 3. The **router agent** is shown only the currently live workers from `workers.yaml` and outputs a JSON subtask plan: `[{worker_id, system_prompt, task_prompt}, ...]`.
 4. The controller sends each subtask to its assigned worker via `POST /run`, all at once; results are returned in plan order.
 5. Each worker sends `system_prompt` as the system message and `task_prompt` as the user message to its Ollama model.
-6. If a call to a worker fails, that worker is immediately marked dead.
+6. If a worker can't be reached or returns an error status, it is immediately marked dead. A worker that runs past `WORKER_TIMEOUT` gets an error result but stays live.
 7. The **synthesizer agent** merges all worker results into a final answer.
 8. `DispatchResponse` returns `request_id`, `subtasks`, `results`, and `synthesis`.
 
-Dispatch is concurrent, but when several workers share one Ollama server, Ollama decides how many requests actually run at once (see its `OLLAMA_NUM_PARALLEL` and `OLLAMA_MAX_LOADED_MODELS` settings, and available memory). For real parallelism across different models, run workers against separate Ollama hosts with `OLLAMA_HOST`.
+Dispatch is concurrent, but when several workers share one Ollama server, Ollama decides how many requests actually run at once (see its `OLLAMA_NUM_PARALLEL` and `OLLAMA_MAX_LOADED_MODELS` settings, and available memory). For real parallelism across different models, run workers against separate Ollama hosts with `OLLAMA_HOST`. Workers that share one model share one loaded copy of it, which is why the default `workers.yaml` runs every enabled worker on `gemma4` and keeps a `granite4.2` entry disabled.
 
 If the router agent returns unparseable JSON (or an empty plan), the controller falls back to broadcasting the original prompt to all live workers with a generic system prompt. A subtask that names an unknown worker is reassigned to the first live worker.
 
@@ -40,7 +40,7 @@ The Python version used the Agno framework. The Go version replaces the small pa
 
 ## Worker health tracking
 
-The controller probes every enabled worker's `GET /health` at startup (before serving any requests) and again on a background timer (`HEALTH_POLL_INTERVAL`, default 30 s), probing all workers concurrently. Only workers that answer `200` with `ok: true`, a status other than `offline`, and a `worker_id` matching the registry are considered live. `/dispatch` only routes tasks to live workers. If a dispatch call to a worker fails mid-flight (connection error, timeout, or a non-2xx status), that worker is marked dead until the next successful probe.
+The controller probes every enabled worker's `GET /health` at startup (before serving any requests) and again on a background timer (`HEALTH_POLL_INTERVAL`, default 30 s), probing all workers concurrently. Only workers that answer `200` with `ok: true`, a status other than `offline`, and a `worker_id` matching the registry are considered live. `/dispatch` only routes tasks to live workers. If a dispatch call to a worker fails mid-flight with a connection error or a non-2xx status, that worker is marked dead until the next successful probe. A timeout is treated differently: the subtask fails with a "did not finish within" error, but the worker stays live, since slow is not the same as down. A dispatch cancelled by its client doesn't mark anyone dead either.
 
 `GET /workers` returns each enabled worker's registry metadata with its current `alive` status.
 
@@ -132,6 +132,7 @@ All services accept `--host` (default `0.0.0.0`) and `--port`.
 - `ROUTER_MODEL_ID` — Ollama model for the router agent (default: `gemma4`)
 - `SYNTHESIZER_MODEL_ID` — Ollama model for the synthesizer agent (default: `gemma4`)
 - `HEALTH_POLL_INTERVAL` — seconds between background worker health probes (default: `30`)
+- `WORKER_TIMEOUT` — seconds each worker gets to finish one subtask (default: `300`)
 - `WORKERS_FILE` or `--workers` — registry path (default: `workers.yaml` in the current directory)
 
 **All services:**
@@ -139,6 +140,7 @@ All services accept `--host` (default `0.0.0.0`) and `--port`.
 
 **Chat client:**
 - `CONTROLLER_URL` or `--url` — base URL of the controller (default: `http://localhost:8100`)
+- `CHAT_TIMEOUT` or `--timeout` — seconds to wait for each dispatch (default: `900`); keep it above `WORKER_TIMEOUT` plus time for the router and synthesizer
 - `GLAMOUR_STYLE` — Markdown style, e.g. `light` for light terminals (default: `dark`)
 
 ## workers.yaml format
