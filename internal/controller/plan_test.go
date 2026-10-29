@@ -115,26 +115,40 @@ func TestPoolAcquire(t *testing.T) {
 	p.register(reg("b", 2, "gpu"))
 	ctx := context.Background()
 
-	// The hinted worker wins when free.
-	if w, _ := p.acquire(ctx, schemas.SubTask{WorkerID: "a"}, nil); w.WorkerID != "a" {
-		t.Fatalf("hint ignored, got %s", w.WorkerID)
+	// A pinned subtask gets its worker...
+	if w, _ := p.acquire(ctx, schemas.SubTask{WorkerID: "a"}, "", nil); w.WorkerID != "a" {
+		t.Fatalf("pin ignored, got %s", w.WorkerID)
 	}
-	// a is full now; b is the only choice.
-	if w, _ := p.acquire(ctx, schemas.SubTask{WorkerID: "a"}, nil); w.WorkerID != "b" {
-		t.Fatalf("full worker chosen, got %s", w.WorkerID)
+	// ...and waits for it when it's full, rather than moving to b.
+	got := make(chan string)
+	go func() {
+		w, _ := p.acquire(ctx, schemas.SubTask{WorkerID: "a"}, "", nil)
+		got <- w.WorkerID
+	}()
+	select {
+	case id := <-got:
+		t.Fatalf("pinned acquire returned %s while a was full", id)
+	case <-time.After(100 * time.Millisecond):
 	}
-	// Requirements filter workers.
-	if _, err := p.acquire(ctx, schemas.SubTask{Requires: []string{"laser"}}, nil); err == nil || !strings.Contains(err.Error(), "laser") {
+	p.release("a")
+	if id := <-got; id != "a" {
+		t.Fatalf("got %s after releasing a", id)
+	}
+
+	// A soft preference wins when that worker is free; requirements filter workers.
+	if w, _ := p.acquire(ctx, schemas.SubTask{}, "b", nil); w.WorkerID != "b" {
+		t.Fatalf("preference ignored, got %s", w.WorkerID)
+	}
+	if _, err := p.acquire(ctx, schemas.SubTask{Requires: []string{"laser"}}, "", nil); err == nil || !strings.Contains(err.Error(), "laser") {
 		t.Fatalf("want a no-worker error naming the requirement, got %v", err)
 	}
 
-	// b has one slot left; take it, then the next acquire must wait for a release.
-	if w, _ := p.acquire(ctx, schemas.SubTask{Requires: []string{"gpu"}}, nil); w.WorkerID != "b" {
+	// a is full and b has one slot left: take it, then the next acquire waits for a release.
+	if w, _ := p.acquire(ctx, schemas.SubTask{Requires: []string{"gpu"}}, "", nil); w.WorkerID != "b" {
 		t.Fatalf("got %s, want b", w.WorkerID)
 	}
-	got := make(chan string)
 	go func() {
-		w, _ := p.acquire(ctx, schemas.SubTask{}, nil)
+		w, _ := p.acquire(ctx, schemas.SubTask{}, "", nil)
 		got <- w.WorkerID
 	}()
 	select {
@@ -142,9 +156,9 @@ func TestPoolAcquire(t *testing.T) {
 		t.Fatalf("acquire returned %s while every slot was taken", id)
 	case <-time.After(100 * time.Millisecond):
 	}
-	p.release("a")
-	if id := <-got; id != "a" {
-		t.Fatalf("got %s after releasing a", id)
+	p.release("b")
+	if id := <-got; id != "b" {
+		t.Fatalf("got %s after releasing b", id)
 	}
 
 	// A dead worker is skipped until it heartbeats again.

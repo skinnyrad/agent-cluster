@@ -216,7 +216,7 @@ func (c *Controller) runJob(ctx context.Context, jr *jobRun, req schemas.JobRequ
 			break
 		}
 
-		rv, err := c.review(ctx, req.Prompt, all, results)
+		rv, err := c.review(ctx, req.Prompt, history, all, results)
 		if err != nil {
 			if ctx.Err() != nil {
 				fail(ctx.Err())
@@ -233,7 +233,7 @@ func (c *Controller) runJob(ctx context.Context, jr *jobRun, req schemas.JobRequ
 	}
 
 	jr.emit(schemas.Event{Type: schemas.EventSynthesisStarted})
-	synthesis, err := c.synthesize(ctx, req.Prompt, all, results, func(tok string) {
+	synthesis, err := c.synthesize(ctx, req.Prompt, history, all, results, func(tok string) {
 		jr.emit(schemas.Event{Type: schemas.EventSynthesisToken, Text: tok})
 	})
 	if err != nil {
@@ -272,7 +272,7 @@ func (c *Controller) runRound(ctx context.Context, jr *jobRun, subtasks, all []s
 			}
 			running++
 			go func(st schemas.SubTask) {
-				finished <- c.runSubtask(ctx, jr, st, depContext(byID, deps), taskCtx)
+				finished <- c.runSubtask(ctx, jr, st, sameWorker(deps), depContext(byID, deps), taskCtx)
 			}(st)
 		}
 		pending = waiting
@@ -290,6 +290,19 @@ func (c *Controller) runRound(ctx context.Context, jr *jobRun, subtasks, all []s
 		results[r.SubtaskID] = r
 		jr.update(func(j *schemas.Job) { j.Results = append(j.Results, r) })
 	}
+}
+
+// sameWorker returns the worker that ran every one of deps, or "" if they ran on
+// different workers. A subtask runs best there, next to any files its dependencies wrote.
+func sameWorker(deps []schemas.AgentResult) string {
+	worker := ""
+	for i, r := range deps {
+		if i > 0 && r.WorkerID != worker {
+			return ""
+		}
+		worker = r.WorkerID
+	}
+	return worker
 }
 
 // depContext formats the results a subtask depends on.
@@ -319,9 +332,9 @@ func truncate(s string, n int) string {
 	return s[:n] + "\n[truncated]"
 }
 
-// runSubtask runs one subtask on a worker, retrying once on another worker if the first
-// can't be reached.
-func (c *Controller) runSubtask(ctx context.Context, jr *jobRun, st schemas.SubTask, deps string, taskCtx map[string]any) schemas.AgentResult {
+// runSubtask runs one subtask on a worker, preferring prefer, and retries once on
+// another worker if the first can't be reached.
+func (c *Controller) runSubtask(ctx context.Context, jr *jobRun, st schemas.SubTask, prefer, deps string, taskCtx map[string]any) schemas.AgentResult {
 	task := schemas.AgentTask{
 		TaskID:       uuid.NewString(),
 		SystemPrompt: st.SystemPrompt,
@@ -331,7 +344,7 @@ func (c *Controller) runSubtask(ctx context.Context, jr *jobRun, st schemas.SubT
 	tried := map[string]bool{}
 	var result schemas.AgentResult
 	for attempt := 1; attempt <= 2; attempt++ {
-		reg, err := c.pool.acquire(ctx, st, tried)
+		reg, err := c.pool.acquire(ctx, st, prefer, tried)
 		if err != nil {
 			if attempt > 1 && errors.Is(err, errNoWorker) {
 				break // keep the first attempt's error
@@ -470,20 +483,12 @@ func (c *Controller) plan(ctx context.Context, prompt string, history []turn, wo
 		"Workers do not see the conversation or each other's work, so every task_prompt must include all the context it needs.",
 		"Subtasks run in parallel. If a subtask needs another's output, list that subtask's id in depends_on; its results will be added to the task_prompt automatically.",
 		"If a subtask needs a tool or capability (for example read_file, run_command, fetch_url, or a tag), list it in requires. Only use names that appear in the worker list. Workers with tools can read and write files in their own workspace, run commands, or fetch web pages, depending on the tools listed.",
-		"Leave worker_id empty unless one specific worker is clearly best; the scheduler balances load.",
+		"Each worker has its own private workspace: files one worker writes are invisible to the others. Give subtasks that share files the same worker_id. Otherwise leave worker_id empty and the scheduler balances load.",
 	})
 	router.Format = planSchema
 
-	var b strings.Builder
-	if len(history) > 0 {
-		b.WriteString("Conversation so far (oldest first):\n")
-		for _, t := range history {
-			fmt.Fprintf(&b, "User: %s\nAssistant: %s\n\n", truncate(t.Prompt, maxHistoryInPrompt), truncate(t.Synthesis, maxHistoryInPrompt))
-		}
-	}
-	fmt.Fprintf(&b, "Task: %s\n\nAvailable workers:\n%s\nPlan the subtasks.", prompt, desc.String())
-
-	resp, err := router.Run(ctx, b.String())
+	resp, err := router.Run(ctx, fmt.Sprintf("%sTask: %s\n\nAvailable workers:\n%s\nPlan the subtasks.",
+		formatHistory(history), prompt, desc.String()))
 	if err != nil {
 		return nil, err
 	}
@@ -494,16 +499,31 @@ func (c *Controller) plan(ctx context.Context, prompt string, history []turn, wo
 	return fallbackPlan(prompt), nil
 }
 
+// formatHistory shows earlier exchanges of the conversation, so the agents can resolve
+// follow-up questions like "what is its population?".
+func formatHistory(history []turn) string {
+	if len(history) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Conversation so far (oldest first):\n")
+	for _, t := range history {
+		fmt.Fprintf(&b, "User: %s\nAssistant: %s\n\n", truncate(t.Prompt, maxHistoryInPrompt), truncate(t.Synthesis, maxHistoryInPrompt))
+	}
+	return b.String()
+}
+
 // review asks whether the results so far answer the task, and for follow-up subtasks if not.
-func (c *Controller) review(ctx context.Context, prompt string, all []schemas.SubTask, results map[string]schemas.AgentResult) (review, error) {
+func (c *Controller) review(ctx context.Context, prompt string, history []turn, all []schemas.SubTask, results map[string]schemas.AgentResult) (review, error) {
 	reviewer := c.newAgent(c.cfg.RouterModel, []string{
 		"You review the work of a cluster of AI worker agents.",
-		"Decide whether the subtask results together fully answer the original task.",
+		"Decide whether the subtask results together fully answer the original task. Read the task in the light of the conversation so far, if any.",
 		"Set complete to true unless something important is missing or wrong AND more work by the workers could fix it. Do not ask for polish.",
 		"If not complete, explain why in reason and add at most 3 follow-up subtasks. Follow-ups may list earlier subtask ids in depends_on to receive their results. Each task_prompt must include all the context it needs.",
 	})
 	reviewer.Format = reviewSchema
-	resp, err := reviewer.Run(ctx, fmt.Sprintf("Original task: %s\n\nSubtask results:\n%s", prompt, formatResults(all, results)))
+	resp, err := reviewer.Run(ctx, fmt.Sprintf("%sOriginal task: %s\n\nSubtask results:\n%s",
+		formatHistory(history), prompt, formatResults(all, results)))
 	if err != nil {
 		return review{}, err
 	}
@@ -511,11 +531,11 @@ func (c *Controller) review(ctx context.Context, prompt string, all []schemas.Su
 }
 
 // synthesize merges the results into the final answer, streaming its tokens.
-func (c *Controller) synthesize(ctx context.Context, prompt string, all []schemas.SubTask, results map[string]schemas.AgentResult, onToken func(string)) (string, error) {
+func (c *Controller) synthesize(ctx context.Context, prompt string, history []turn, all []schemas.SubTask, results map[string]schemas.AgentResult, onToken func(string)) (string, error) {
 	synth := c.newAgent(c.cfg.SynthesizerModel, []string{
 		"You are a synthesis agent.",
 		"You receive the results from multiple specialist worker agents and combine them into a single coherent final answer.",
-		"Be concise and structured. Directly address the original task.",
+		"Be concise and structured. Directly address the original task, read in the light of the conversation so far, if any.",
 	})
 	synth.Markdown = true
 	synth.OnEvent = func(e agent.Event) {
@@ -523,8 +543,8 @@ func (c *Controller) synthesize(ctx context.Context, prompt string, all []schema
 			onToken(e.Text)
 		}
 	}
-	resp, err := synth.Run(ctx, fmt.Sprintf(
-		"Original task: %s\n\nWorker results:\n%s\n\nSynthesize a final answer.", prompt, formatResults(all, results)))
+	resp, err := synth.Run(ctx, fmt.Sprintf("%sOriginal task: %s\n\nWorker results:\n%s\n\nSynthesize a final answer.",
+		formatHistory(history), prompt, formatResults(all, results)))
 	if err != nil {
 		return "", err
 	}

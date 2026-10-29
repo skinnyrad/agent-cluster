@@ -317,8 +317,10 @@ func (v *jobView) handle(e schemas.Event) {
 	case schemas.EventReview:
 		if len(e.Subtasks) > 0 {
 			v.status.Println(yellow.Render("Reviewer: ") + e.Text)
-		} else {
+		} else if e.Text != "" {
 			v.status.Println(dim.Render("Reviewer: " + e.Text))
+		} else {
+			v.status.Println(dim.Render("Reviewer: complete"))
 		}
 		v.phase = "Reviewing"
 	case schemas.EventSynthesisStarted:

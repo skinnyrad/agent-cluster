@@ -211,6 +211,19 @@ func TestDependenciesPassResultsAlong(t *testing.T) {
 	}
 }
 
+func TestDependentSubtasksFollowTheirDependencysWorker(t *testing.T) {
+	f := fakeollama.Start(t)
+	// t2 isn't pinned, but t1 ran on w2, which may have files t2 needs.
+	f.RouterReply = plan(st("t1", "write a file", `"worker_id": "w2"`), st("t2", "use it", `"depends_on": ["t1"]`))
+	c := startCluster(t, f, nil, w("w1"), w("w2"))
+
+	_, resp := c.dispatch("x", "")
+	results := resultsByID(resp)
+	if results["t1"].WorkerID != "w2" || results["t2"].WorkerID != "w2" {
+		t.Errorf("t1 on %s, t2 on %s; want both on w2", results["t1"].WorkerID, results["t2"].WorkerID)
+	}
+}
+
 func TestIndependentSubtasksRunConcurrently(t *testing.T) {
 	f := fakeollama.Start(t)
 	f.RouterReply = plan(st("t1", "one"), st("t2", "two"), st("t3", "three"))
@@ -343,14 +356,20 @@ func TestSessionHistoryReachesTheRouter(t *testing.T) {
 	f := fakeollama.Start(t)
 	f.RouterReply = plan(st("t1", "x"))
 	f.SynthesisReply = "Paris"
-	c := startCluster(t, f, nil, w("w1"))
+	c := startCluster(t, f, func(cfg *controller.Config) { cfg.MaxRounds = 2 }, w("w1"))
 
 	_, first := c.dispatch("What is the capital of France?", "")
 	c.dispatch("And its population?", first.SessionID)
 	c.dispatch("Unrelated", "other-session")
 
-	if !strings.Contains(f.RouterPrompts[1], "User: What is the capital of France?\nAssistant: Paris") {
-		t.Errorf("second router prompt lacks the first exchange:\n%s", f.RouterPrompts[1])
+	// Every agent that reads the task needs the history to resolve "its".
+	const exchange = "User: What is the capital of France?\nAssistant: Paris"
+	for name, prompt := range map[string]string{
+		"router": f.RouterPrompts[1], "reviewer": f.ReviewPrompts[1], "synthesizer": f.SynthPrompts[1],
+	} {
+		if !strings.Contains(prompt, exchange) {
+			t.Errorf("second %s prompt lacks the first exchange:\n%s", name, prompt)
+		}
 	}
 	if strings.Contains(f.RouterPrompts[2], "France") {
 		t.Errorf("another session's history leaked:\n%s", f.RouterPrompts[2])

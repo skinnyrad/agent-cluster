@@ -140,22 +140,31 @@ func (p *pool) canSatisfy(requires []string) bool {
 var errNoWorker = errors.New("no live worker")
 
 // acquire waits for a free slot on a live worker that meets the subtask's requirements,
-// preferring the worker it names and otherwise the least loaded one, and reserves it.
-// exclude lists workers not to use (for retries).
-func (p *pool) acquire(ctx context.Context, st schemas.SubTask, exclude map[string]bool) (schemas.WorkerRegistration, error) {
+// and reserves it. A subtask that names a worker (st.WorkerID) waits for that worker while
+// it is alive and eligible, since it may need files in that worker's workspace. Otherwise
+// prefer, if free, wins, then the least loaded worker. exclude lists workers not to use
+// (for retries).
+func (p *pool) acquire(ctx context.Context, st schemas.SubTask, prefer string, exclude map[string]bool) (schemas.WorkerRegistration, error) {
 	for {
 		p.mu.Lock()
+		pinned := ""
+		if e, ok := p.workers[st.WorkerID]; ok && !exclude[st.WorkerID] && p.aliveLocked(e) && satisfies(e.reg, st.Requires) {
+			pinned = st.WorkerID
+		}
 		var best *poolEntry
 		eligible := false
 		for _, e := range p.workers {
 			if exclude[e.reg.WorkerID] || !p.aliveLocked(e) || !satisfies(e.reg, st.Requires) {
 				continue
 			}
+			if pinned != "" && e.reg.WorkerID != pinned {
+				continue
+			}
 			eligible = true
 			if e.inFlight >= e.reg.Slots {
 				continue
 			}
-			if e.reg.WorkerID == st.WorkerID {
+			if e.reg.WorkerID == prefer {
 				best = e
 				break
 			}
