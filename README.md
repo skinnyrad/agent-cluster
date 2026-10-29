@@ -1,148 +1,144 @@
 # agent-cluster
 
-A general-purpose distributed agent cluster for local models. A central controller (backed by an LLM) decomposes tasks on the fly, assigns roles to workers at runtime, and synthesizes their results into a final answer.
+A general-purpose distributed agent cluster for local models. A controller breaks each request into subtasks, schedules them across worker agents on one or more machines, and merges their results into one answer. Workers run [Ollama](https://ollama.com/) models and can use tools: read and write files, run commands, and fetch web pages.
 
-## Overview
+Everything runs on your own hardware. Nothing leaves your machines.
 
-`agent-cluster` runs one controller service and any number of generic worker services, all written in Go and backed by local models served by [Ollama](https://ollama.com/):
+## How it works
 
-- Each **worker** is role-agnostic — it receives a dynamic `system_prompt` per request that defines its role for that task, then makes a fresh call to its Ollama model.
-- The **controller** is itself an LLM-driven router. It reads the available worker pool from `workers.yaml`, uses a **router agent** to decompose the user's prompt into per-worker subtasks (each with a custom system prompt and task prompt), dispatches them over HTTP, and uses a **synthesizer agent** to merge the results into a final answer.
-- Shared types in `internal/schemas` define the JSON request/response contracts used by the controller, workers and chat client.
+- A **worker** runs one Ollama model. Each task arrives with its own system prompt, so workers have no fixed role. A worker can call tools in a loop until it has an answer, runs at most `--slots` tasks at once, and registers itself with the controller.
+- The **controller** turns each request into a **job**:
+  1. A **router** agent plans subtasks, using Ollama's structured output. A subtask can depend on others and can require a tool or tag.
+  2. A **scheduler** places each subtask on a live worker with a free slot as soon as its dependencies finish, passing their results along.
+  3. A **reviewer** agent checks the results and can add a follow-up round.
+  4. A **synthesizer** agent streams the final answer.
+- Clients follow a job's progress live as server-sent events. Jobs, events and conversation history are stored in SQLite.
+- The **chat** client shows the plan, tool calls and results as they happen.
 
-Workers have no fixed roles — the controller assigns roles dynamically at dispatch time based on what the task requires and how many workers are available.
+See [Architecture.md](Architecture.md) for the details.
 
-## Project layout
+## Quick start
 
-```text
-agent-cluster/
-├── go.mod
-├── workers.yaml
-├── cmd/
-│   ├── controller/      # controller entry point
-│   ├── worker/          # worker entry point
-│   └── chat/            # interactive terminal chat client
-└── internal/
-    ├── agent/           # minimal Ollama-backed LLM agent
-    ├── controller/      # router → dispatch → synthesizer pipeline, health polling
-    ├── worker/          # /health and /run handlers
-    ├── registry/        # workers.yaml loader
-    ├── schemas/         # shared JSON contracts
-    └── httputil/        # small HTTP/env helpers
+You need [Ollama](https://ollama.com/download) running with a model that supports tool calling, for example:
+
+```bash
+ollama pull gemma4
 ```
 
-For detailed architecture and design decisions, see `Architecture.md`.
+Download `agent-cluster` for your platform from the [releases page](https://github.com/skinnyrad/agent-cluster/releases), or build it with Go 1.26+:
 
-## Getting started
+```bash
+go build -o agent-cluster ./cmd/agent-cluster
+```
 
-1. **Install prerequisites**
+Start the controller, then one or more workers, each in its own terminal:
 
-   - Go 1.26 or newer
-   - Ollama, running, with the models you plan to use (for example `ollama pull gemma4`)
+```bash
+./agent-cluster controller
+```
 
-2. **Build** (optional — `go run` works too)
+```bash
+./agent-cluster worker --id worker-1 --port 8001
+```
 
-   ```bash
-   go build -o bin/ ./cmd/...
-   ```
+```bash
+./agent-cluster worker --id worker-2 --port 8002 --tools files,shell
+```
 
-3. **Configure workers**
+Then talk to the cluster:
 
-   Edit `workers.yaml` to list your workers with `worker_id`, `url`, `model_id`, `enabled`, and `tags`. No `role` needed.
+```bash
+./agent-cluster chat
+```
 
-   The default fleet runs both enabled workers on `gemma4`, so Ollama keeps a single model loaded and can serve them in parallel. A `granite4.2` worker is listed but disabled: on a 32 GB machine it can't stay loaded next to `gemma4`, and the two models end up swapping instead of running together.
+Workers register with the controller at `http://localhost:8100` by default. The repository's `workers.yaml` is an allowlist that permits `worker-1` and `worker-2`. Edit it to add workers, or delete it to allow any worker.
 
-4. **Run workers** (start as many as you want — they are all generic)
+## Tools
 
-   ```bash
-   WORKER_ID=worker-1 MODEL_ID=gemma4 go run ./cmd/worker --port 8001
-   ```
-   ```bash
-   WORKER_ID=worker-2 MODEL_ID=gemma4 go run ./cmd/worker --port 8002
-   ```
+Workers enable tools with `--tools` (default `files`):
 
-5. **Run the controller** (from the repository root, so it finds `workers.yaml`)
+| Set | Tools | What they can do |
+|---|---|---|
+| `files` | `list_files`, `read_file`, `write_file` | Read and write files inside the worker's workspace (`--workspace`, default `workspace/<id>`). Paths can't escape it, including through symlinks. |
+| `shell` | `run_command` | Run a shell command in the workspace, killed after `--command-timeout` seconds. **This is not a security sandbox**: commands run as your user. Only enable it on machines and for prompts you trust, or run the worker in a container or VM. |
+| `web` | `fetch_url` | Fetch an http(s) URL and return its text. |
 
-   ```bash
-   ROUTER_MODEL_ID=gemma4 SYNTHESIZER_MODEL_ID=gemma4 go run ./cmd/controller --port 8100
-   ```
+Each worker has its own workspace. The router keeps subtasks that share files on the same worker, and a subtask runs on the worker that ran its dependencies when it can.
 
-Every service takes `--host` (default `0.0.0.0`) and `--port`. The controller also takes `--workers` to point at a different registry file, and `WORKER_TIMEOUT` sets how many seconds each worker gets per subtask (default 300). A worker that times out fails that subtask but stays in the pool. Set `OLLAMA_HOST` if Ollama isn't on `http://localhost:11434`.
+The model has to support tool calling in Ollama. Use `--tools ""` for a worker without tools.
 
-## Example usage
+## Running on several machines
 
-- Check a worker:
+By default every service listens only on `127.0.0.1`. To accept connections from other machines, listen on all interfaces and set a shared token. Nodes refuse to listen beyond localhost without one.
 
-  ```bash
-  curl http://localhost:8001/health
-  ```
+```bash
+export CLUSTER_TOKEN=$(openssl rand -hex 16)   # use the same value on every machine
 
-- List available workers:
+# controller machine
+./agent-cluster controller --host 0.0.0.0
 
-  ```bash
-  curl http://localhost:8100/workers
-  ```
+# each worker machine
+./agent-cluster worker --id gpu-box --host 0.0.0.0 \
+  --controller http://controller-host:8100 --advertise http://gpu-box:8001 --tags gpu
 
-- **Interactive chat (recommended):** Start a conversation with the fleet using the built-in terminal client:
+# anywhere
+./agent-cluster chat --url http://controller-host:8100
+```
 
-  ```bash
-  go run ./cmd/chat
-  # or point at a non-default controller:
-  go run ./cmd/chat --url http://localhost:8100
-  # or via environment variable:
-  CONTROLLER_URL=http://localhost:8100 go run ./cmd/chat
-  ```
+`--advertise` is the URL the controller uses to reach the worker. Traffic is plain HTTP, so use a trusted network or a VPN.
 
-  The chat client supports:
-  - **↑ / ↓** arrows to cycle through your previous inputs
-  - **← / →** arrows to move the cursor within the current line
-  - **6-turn rolling context** — the last 6 user+assistant exchanges are included automatically as conversation history on each dispatch
-  - **Verbose status** — a live spinner cycles through *Tasking fleet → Router decomposing → Dispatching to workers → Waiting on fleet results* while the request is in flight
-  - **Slash commands** — `/workers`, `/clear`, `/help`, `/quit`
+Ollama handles one request at a time per model by default. To run several tasks on one machine at once, start Ollama with `OLLAMA_NUM_PARALLEL=N` and give the worker `--slots N`. Running different models on one machine needs enough memory to keep them all loaded.
 
-  The client waits up to 15 minutes for each dispatch; change that with `--timeout <seconds>` or `CHAT_TIMEOUT`.
+## Using the API
 
-  Markdown is rendered with a dark-background style. On a light terminal, run it with `GLAMOUR_STYLE=light`.
+| Method and path | Purpose |
+|---|---|
+| `POST /jobs` | Start a job: `{"prompt": "...", "session_id": "..."}`. Returns `{"job_id", "session_id"}` right away. Reuse `session_id` to continue a conversation. |
+| `GET /jobs/{id}/events` | Follow a job as server-sent events: plan, subtask start/finish, tokens, tool calls, review, synthesis, and the final `job.finished`. Finished jobs replay their stored events. |
+| `GET /jobs/{id}` | The job's current state. |
+| `DELETE /jobs/{id}` | Cancel a running job. |
+| `GET /jobs?session_id=...` | Recent jobs, optionally for one conversation. |
+| `POST /dispatch` | Run a job and wait for it (synchronous). |
+| `GET /workers` | Registered workers, with load, tools and liveness. |
 
-- Dispatch a task directly (the controller decides how many workers to use and what each one does):
+```bash
+curl -s -X POST localhost:8100/jobs -H 'Content-Type: application/json' \
+  -d '{"prompt": "Write a Python bubble sort in sort.py with tests, run them, and report."}'
+curl -N localhost:8100/jobs/<job_id>/events
+```
 
-  ```bash
-  curl -X POST http://localhost:8100/dispatch \
-    -H "Content-Type: application/json" \
-    -d '{"prompt": "Do a code review and write tests for a Python bubble sort function."}'
-  ```
+Add `-H "Authorization: Bearer $CLUSTER_TOKEN"` when the cluster uses a token.
 
-  Response shape:
-  ```json
-  {
-    "request_id": "...",
-    "original_prompt": "...",
-    "subtasks": [
-      {"worker_id": "worker-1", "system_prompt": "You are a code reviewer...", "task_prompt": "..."},
-      {"worker_id": "worker-2", "system_prompt": "You are a test engineer...", "task_prompt": "..."}
-    ],
-    "results": [...],
-    "synthesis": "Final synthesized answer..."
-  }
-  ```
+## Configuration
 
-### Chat slash commands
+Every flag has an environment variable; run `agent-cluster <command> -h` for the full list.
+
+**Controller:** `--port` (8100), `--db` (`agent-cluster.db`), `--workers` (allowlist, `workers.yaml`), `--router-model` and `--synthesizer-model` (`gemma4`), `--max-rounds` (2; 1 turns off the reviewer), `--worker-timeout` (300 s per subtask), `--history-turns` (6), `--num-ctx` (16384), `--num-predict` (4096).
+
+**Worker:** `--id`, `--model` (`gemma4`), `--port` (8001), `--controller`, `--advertise`, `--tools`, `--workspace`, `--tags`, `--slots` (1), `--max-steps` (8 model calls per task), `--num-ctx` (16384), `--num-predict` (4096).
+
+**Chat:** `--url` (`http://localhost:8100`), `--timeout` (900 s per job). Use `GLAMOUR_STYLE=light` on a light terminal.
+
+**Everything:** `--token` / `CLUSTER_TOKEN`, `--host`, `OLLAMA_HOST` (default `http://localhost:11434`).
+
+`--num-ctx` sets each model's context window explicitly. Ollama's default for some models is far larger and can use a lot of memory.
+
+## Chat commands
 
 | Command | Description |
 |---|---|
-| `/workers` | Display a live status table of all registered workers |
-| `/clear` | Clear the rolling conversation history |
-| `/help` | Show available slash commands |
-| `/quit` | Exit the chat client |
+| `/workers` | Registered workers and their load |
+| `/jobs` | Recent jobs in this conversation |
+| `/clear` | Start a new conversation |
+| `/help` | Show commands |
+| `/quit` | Exit |
 
-## Testing
+Press Ctrl-C while a job runs to cancel it.
+
+## Development
 
 ```bash
-go test ./...
+go test -race ./...
 ```
 
-The controller tests start real workers and a fake Ollama server in-process, so they run without Ollama or any models installed.
-
-## Documentation
-
-- Architecture details and design decisions live in `Architecture.md`.
+The tests run real controllers and workers in-process against a fake Ollama (`internal/fakeollama`), so they need no models. Pushing a `v*` tag builds release archives for Linux, macOS and Windows.
