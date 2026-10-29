@@ -4,11 +4,11 @@ Agent-cluster framework used in the AI For TSCM 2 course. It provides a dynamic 
 
 ## Overview
 
-`agent-cluster` runs one controller service and any number of generic worker services:
+`agent-cluster` runs one controller service and any number of generic worker services, all written in Go and backed by local models served by [Ollama](https://ollama.com/):
 
-- Each **worker** is role-agnostic — it receives a dynamic `system_prompt` per request that defines its role for that task, then creates a fresh Agno `Agent` and executes the work.
-- The **controller** is itself an LLM-driven router. It reads the available worker pool from `workers.yaml`, uses a **router Agent** to decompose the user's prompt into per-worker subtasks (each with a custom system prompt and task prompt), dispatches them over HTTP, and uses a **synthesizer Agent** to merge the results into a final answer.
-- Shared Pydantic models in `schemas.py` define the request/response contracts used by both controller and workers.
+- Each **worker** is role-agnostic — it receives a dynamic `system_prompt` per request that defines its role for that task, then makes a fresh call to its Ollama model.
+- The **controller** is itself an LLM-driven router. It reads the available worker pool from `workers.yaml`, uses a **router agent** to decompose the user's prompt into per-worker subtasks (each with a custom system prompt and task prompt), dispatches them over HTTP, and uses a **synthesizer agent** to merge the results into a final answer.
+- Shared types in `internal/schemas` define the JSON request/response contracts used by the controller, workers and chat client.
 
 Workers have no fixed roles — the controller assigns roles dynamically at dispatch time based on what the task requires and how many workers are available.
 
@@ -16,54 +16,56 @@ Workers have no fixed roles — the controller assigns roles dynamically at disp
 
 ```text
 agent-cluster/
-├── requirements.txt
+├── go.mod
 ├── workers.yaml
-├── schemas.py
-├── worker.py
-├── controller.py
-└── chat.py
+├── cmd/
+│   ├── controller/      # controller entry point
+│   ├── worker/          # worker entry point
+│   └── chat/            # interactive terminal chat client
+└── internal/
+    ├── agent/           # minimal Ollama-backed LLM agent
+    ├── controller/      # router → dispatch → synthesizer pipeline, health polling
+    ├── worker/          # /health and /run handlers
+    ├── registry/        # workers.yaml loader
+    ├── schemas/         # shared JSON contracts
+    └── httputil/        # small HTTP/env helpers
 ```
-
-- `requirements.txt` — runtime dependencies for all components.
-- `workers.yaml` — fleet registry with worker IDs, URLs, model IDs, enabled flags, and tags. No `role` field.
-- `schemas.py` — shared Pydantic models (`AgentTask`, `AgentResult`, `WorkerInfo`, `SubTask`, `DispatchRequest`, `DispatchResponse`, etc.).
-- `worker.py` — FastAPI app exposing `/health` and `/run`. Creates a per-request `Agent` using the provided `system_prompt`.
-- `controller.py` — FastAPI app with a two-stage LLM pipeline: router Agent (task decomposition) + synthesizer Agent (result merging).
-- `chat.py` — interactive terminal chat client for the controller with conversation history, slash commands, and verbose status output.
 
 For detailed architecture and design decisions, see `Architecture.md`.
 
 ## Getting started
 
-1. **Install dependencies**
+1. **Install prerequisites**
+
+   - Go 1.26 or newer
+   - Ollama, running, with the models you plan to use (for example `ollama pull gemma4`)
+
+2. **Build** (optional — `go run` works too)
 
    ```bash
-   python3 -m venv venv
-   source ./venv/bin/activate
-   pip install -r requirements.txt
+   go build -o bin/ ./cmd/...
    ```
 
-2. **Configure workers**
+3. **Configure workers**
 
    Edit `workers.yaml` to list your workers with `worker_id`, `url`, `model_id`, `enabled`, and `tags`. No `role` needed.
 
-3. **Run workers** (start as many as you want — they are all generic)
+4. **Run workers** (start as many as you want — they are all generic)
 
    ```bash
-   WORKER_ID=worker-1 MODEL_ID=gemma4 \
-     uvicorn worker:app --host 0.0.0.0 --port 8001
+   WORKER_ID=worker-1 MODEL_ID=gemma4 go run ./cmd/worker --port 8001
    ```
-   ```
-   WORKER_ID=worker-2 MODEL_ID=gemma4 \
-     uvicorn worker:app --host 0.0.0.0 --port 8002
+   ```bash
+   WORKER_ID=worker-2 MODEL_ID=gemma4 go run ./cmd/worker --port 8002
    ```
 
-4. **Run the controller**
+5. **Run the controller** (from the repository root, so it finds `workers.yaml`)
 
    ```bash
-   ROUTER_MODEL_ID=gemma4 SYNTHESIZER_MODEL_ID=gemma4 \
-     uvicorn controller:app --host 0.0.0.0 --port 8000
+   ROUTER_MODEL_ID=gemma4 SYNTHESIZER_MODEL_ID=gemma4 go run ./cmd/controller --port 8000
    ```
+
+Every service takes `--host` (default `0.0.0.0`) and `--port`. The controller also takes `--workers` to point at a different registry file. Set `OLLAMA_HOST` if Ollama isn't on `http://localhost:11434`.
 
 ## Example usage
 
@@ -82,19 +84,21 @@ For detailed architecture and design decisions, see `Architecture.md`.
 - **Interactive chat (recommended):** Start a conversation with the fleet using the built-in terminal client:
 
   ```bash
-  python chat.py
+  go run ./cmd/chat
   # or point at a non-default controller:
-  python chat.py --url http://localhost:8000
+  go run ./cmd/chat --url http://localhost:8000
   # or via environment variable:
-  CONTROLLER_URL=http://localhost:8000 python chat.py
+  CONTROLLER_URL=http://localhost:8000 go run ./cmd/chat
   ```
 
   The chat client supports:
   - **↑ / ↓** arrows to cycle through your previous inputs
   - **← / →** arrows to move the cursor within the current line
   - **6-turn rolling context** — the last 6 user+assistant exchanges are included automatically as conversation history on each dispatch
-  - **Verbose status** — a live spinner cycles through *Tasking fleet → Router decomposing → Dispatching to workers → Waiting on fleet results → Synthesizing...* while the request is in flight
+  - **Verbose status** — a live spinner cycles through *Tasking fleet → Router decomposing → Dispatching to workers → Waiting on fleet results* while the request is in flight
   - **Slash commands** — `/workers`, `/clear`, `/help`, `/quit`
+
+  Markdown is rendered with a dark-background style. On a light terminal, run it with `GLAMOUR_STYLE=light`.
 
 - Dispatch a task directly (the controller decides how many workers to use and what each one does):
 
@@ -127,8 +131,14 @@ For detailed architecture and design decisions, see `Architecture.md`.
 | `/help` | Show available slash commands |
 | `/quit` | Exit the chat client |
 
+## Testing
+
+```bash
+go test ./...
+```
+
+The controller tests start real workers and a fake Ollama server in-process, so they run without Ollama or any models installed.
+
 ## Documentation
 
 - Architecture details and design decisions live in `Architecture.md`.
-- Agno, FastAPI, Pydantic, and HTTPX usage patterns follow their respective official docs.
-- `chat.py --help` shows CLI flags for the interactive client.
