@@ -21,3 +21,7 @@ go.work.sum
 .vscode/
 .DS_Store
 *.swp
+
+# Controller database and worker tool workspaces
+agent-cluster.db*
+/workspace/

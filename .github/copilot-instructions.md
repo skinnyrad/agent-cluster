@@ -2,81 +2,45 @@
 
 ## Build, Test, and Lint Commands
 
-- **Build everything:**
+- **Build:** `go build -o agent-cluster ./cmd/agent-cluster`
+- **Test:** `go test -race ./...` (no Ollama needed; tests use `internal/fakeollama`)
+- **Lint:** `gofmt -l .` must print nothing; `go vet ./...` must pass
+- **Run locally** (Ollama running with `gemma4`):
   ```bash
-  go build -o bin/ ./cmd/...
+  ./agent-cluster controller
+  ./agent-cluster worker --id worker-1 --port 8001
+  ./agent-cluster worker --id worker-2 --port 8002 --tools files,shell
+  ./agent-cluster chat
   ```
-- **Test and vet:**
+- **Start a job and follow it:**
   ```bash
-  go test ./...
-  go vet ./...
-  ```
-- **Run a worker** (no role needed — workers are generic):
-  ```bash
-  WORKER_ID=worker-1 MODEL_ID=gemma4 go run ./cmd/worker --port 8001
-  ```
-- **Run the controller** (from the repository root):
-  ```bash
-  ROUTER_MODEL_ID=gemma4 SYNTHESIZER_MODEL_ID=gemma4 go run ./cmd/controller --port 8100
-  ```
-- **Run the chat client:**
-  ```bash
-  go run ./cmd/chat --url http://localhost:8100
-  ```
-- **Check a worker:**
-  ```bash
-  curl http://localhost:8001/health
-  ```
-- **List workers from the controller:**
-  ```bash
-  curl http://localhost:8100/workers
-  ```
-- **Dispatch a task:**
-  ```bash
-  curl -X POST http://localhost:8100/dispatch \
-    -H "Content-Type: application/json" \
-    -d '{"prompt": "Do a code review and write tests for a Python bubble sort function."}'
+  curl -s -X POST localhost:8100/jobs -H 'Content-Type: application/json' -d '{"prompt": "..."}'
+  curl -N localhost:8100/jobs/<job_id>/events
   ```
 
 ## High-Level Architecture
 
-This project implements a **dynamic agent router** pattern in Go, using Ollama for all model calls:
+A distributed agent cluster on local Ollama models, in one Go binary with `controller`, `worker` and `chat` subcommands.
 
-- **Controller** (`internal/controller`): A two-stage LLM pipeline. First, a **router agent** receives the user's prompt and the live worker pool, then decomposes the task into per-worker subtasks — each with a dynamically generated `system_prompt` and `task_prompt`. Second, a **synthesizer agent** merges all worker results into a final answer.
-- **Worker** (`internal/worker`): Fully generic. Each `/run` request receives a `system_prompt` from the controller and makes a fresh model call with those instructions. Workers have no fixed role.
-- **Agent** (`internal/agent`): Minimal Ollama `/api/chat` client used by both controller and workers.
-- **Shared types** (`internal/schemas`): JSON contracts — `AgentTask` (includes `system_prompt`), `AgentResult`, `HealthResponse`, `WorkerInfo` (no role), `SubTask`, `DispatchRequest`, `DispatchResponse`.
-- **Fleet Registry** (`workers.yaml`, loaded by `internal/registry`): Lists workers by `worker_id`, `url`, `model_id`, `enabled`, and `tags`. No `role` field — the controller assigns roles dynamically at dispatch time.
-- **Entry points** (`cmd/controller`, `cmd/worker`, `cmd/chat`): Only parse flags and environment variables; logic lives in `internal/`.
+- **Controller** (`internal/controller`): each request is a job. A router agent plans subtasks with `depends_on` and `requires` using Ollama structured output; `normalizePlan` cleans the plan; the scheduler (`pool.go`) runs each subtask on a live worker with a free slot once its dependencies finish; a reviewer agent may add rounds; a synthesizer agent streams the answer. Progress is published as server-sent events and stored in SQLite (`store.go`).
+- **Worker** (`internal/worker`): runs one model. `/run` executes the agent loop from `internal/agent` with the task's system prompt and the worker's tools, enforces `--slots`, and streams newline-delimited JSON events ending in a `result`. Workers register with the controller on a heartbeat.
+- **Tools** (`internal/tools`): `files` (workspace-confined), `shell` (`run_command`, not a sandbox), `web` (`fetch_url`).
+- **Shared types** (`internal/schemas`): registration, tasks, results, subtasks, jobs and events.
 
-### Worker health tracking
-The controller probes every enabled worker's `GET /health` at startup (before serving any requests) and again on a background timer (`HEALTH_POLL_INTERVAL`, default 30 s). Only workers that return `ok: true`, a non-`offline` status, and a matching `worker_id` are considered live. The `/dispatch` endpoint only routes tasks to live workers. If a dispatch call to a worker fails mid-flight with a connection error or a non-2xx status, that worker is immediately marked dead and excluded from subsequent requests until the next successful health probe. A worker that exceeds `WORKER_TIMEOUT` gets a failed result for that subtask but stays live.
-
-`GET /workers` returns each worker's current `alive` status alongside its registry metadata.
-
-### Request flow
-1. **Startup** — controller probes all enabled workers and builds the initial live-worker set.
-2. `POST /dispatch` receives `{"prompt": "..."}`.
-3. Controller's **router agent** receives only the currently live workers and outputs a JSON plan: `[{worker_id, system_prompt, task_prompt}, ...]`.
-4. Controller dispatches each subtask to its assigned worker via `POST /run`, with the dynamic `system_prompt` embedded in the `AgentTask`.
-5. Workers call their Ollama model with the provided `system_prompt` and execute the task.
-6. If a worker is unreachable or returns an error status it is immediately marked dead; a timeout fails the subtask but leaves the worker live.
-7. Controller's **synthesizer agent** combines all results into a final answer.
-8. `DispatchResponse` returns `request_id`, `subtasks` plan, raw `results`, and `synthesis`.
+### Scheduling rules
+- Only live workers (heartbeat within `--heartbeat-ttl`) that have every `requires` capability (tag, tool name or `model:<id>`) and a free slot are eligible.
+- A subtask with `worker_id` waits for that worker while it is alive, because workspaces are per worker.
+- Otherwise prefer the worker that ran all of the subtask's dependencies, then the least loaded.
+- Connection errors and non-2xx responses mark a worker dead and retry the subtask once elsewhere. Timeouts and cancellations do not mark workers dead.
 
 ## Key Conventions
 
-- **No role field** — roles are free-form strings assigned by the router LLM at runtime; `workers.yaml` entries need `worker_id`, `url`, `model_id`, `enabled`, `tags`.
-- **Workers are stateless per request** — a new agent is built per `/run` call using `task.system_prompt`.
-- **JSON field names stay snake_case** — the wire format is shared by every component.
-- **Pass `context.Context`** through network calls so a dropped client cancels in-flight model calls.
-- **Environment variables:**
-  - Workers: `WORKER_ID`, `MODEL_ID`, `WORKER_STATUS`
-  - Controller: `ROUTER_MODEL_ID`, `SYNTHESIZER_MODEL_ID`, `HEALTH_POLL_INTERVAL` (default: `30`), `WORKER_TIMEOUT` (default: `300`), `WORKERS_FILE`
-  - All services: `OLLAMA_HOST`
-  - Chat: `CONTROLLER_URL`, `CHAT_TIMEOUT` (default: `900`), `GLAMOUR_STYLE`
-- **Router fallback:** If the router agent returns unparseable JSON, the controller broadcasts the original prompt to all workers with a generic system prompt.
-- **Extending the worker pool:** Add entries to `workers.yaml` and start the corresponding `cmd/worker` processes. No code changes needed.
+- `cmd/agent-cluster` only parses flags and environment variables; logic belongs in `internal/`.
+- Change `internal/schemas` first when changing anything on the wire; JSON stays snake_case.
+- Thread `context.Context` through network and model calls so job cancellation stops work.
+- Every flag has an environment variable fallback; name it in the flag's help text in brackets.
+- Services default to `127.0.0.1` and must refuse wider exposure without a token (`httputil.CheckExposure`).
+- Add an in-process test in `internal/controller/controller_test.go` for scheduling or job behaviour changes.
 
 ## References
-- See `Architecture.md` for detailed design decisions.
+- See `Architecture.md` for the job lifecycle, event types and security model.
