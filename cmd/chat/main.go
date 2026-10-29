@@ -1,6 +1,6 @@
 // Command chat is an interactive terminal client for the agent-cluster controller.
 //
-//	go run ./cmd/chat [--url http://localhost:8000]
+//	go run ./cmd/chat [--url http://localhost:8100]
 //
 // Slash commands:
 //
@@ -24,7 +24,7 @@ import (
 )
 
 func main() {
-	defaultURL := httputil.Getenv("CONTROLLER_URL", "http://localhost:8000")
+	defaultURL := httputil.Getenv("CONTROLLER_URL", "http://localhost:8100")
 	url := flag.String("url", defaultURL, "controller base URL")
 	flag.Parse()
 	baseURL := strings.TrimRight(*url, "/")

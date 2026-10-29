@@ -17,11 +17,11 @@
   ```
 - **Run the controller** (from the repository root):
   ```bash
-  ROUTER_MODEL_ID=gemma4 SYNTHESIZER_MODEL_ID=gemma4 go run ./cmd/controller --port 8000
+  ROUTER_MODEL_ID=gemma4 SYNTHESIZER_MODEL_ID=gemma4 go run ./cmd/controller --port 8100
   ```
 - **Run the chat client:**
   ```bash
-  go run ./cmd/chat --url http://localhost:8000
+  go run ./cmd/chat --url http://localhost:8100
   ```
 - **Check a worker:**
   ```bash
@@ -29,11 +29,11 @@
   ```
 - **List workers from the controller:**
   ```bash
-  curl http://localhost:8000/workers
+  curl http://localhost:8100/workers
   ```
 - **Dispatch a task:**
   ```bash
-  curl -X POST http://localhost:8000/dispatch \
+  curl -X POST http://localhost:8100/dispatch \
     -H "Content-Type: application/json" \
     -d '{"prompt": "Do a code review and write tests for a Python bubble sort function."}'
   ```

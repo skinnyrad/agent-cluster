@@ -10,11 +10,13 @@ A typical request flow:
 1. **Startup** — the controller probes every enabled worker's `GET /health` and builds the initial live-worker set.
 2. `POST /dispatch` receives `{"prompt": "..."}`.
 3. The **router agent** is shown only the currently live workers from `workers.yaml` and outputs a JSON subtask plan: `[{worker_id, system_prompt, task_prompt}, ...]`.
-4. The controller sends each subtask to its assigned worker via `POST /run`, one worker at a time.
+4. The controller sends each subtask to its assigned worker via `POST /run`, all at once; results are returned in plan order.
 5. Each worker sends `system_prompt` as the system message and `task_prompt` as the user message to its Ollama model.
 6. If a call to a worker fails, that worker is immediately marked dead.
 7. The **synthesizer agent** merges all worker results into a final answer.
 8. `DispatchResponse` returns `request_id`, `subtasks`, `results`, and `synthesis`.
+
+Dispatch is concurrent, but when several workers share one Ollama server, Ollama decides how many requests actually run at once (see its `OLLAMA_NUM_PARALLEL` and `OLLAMA_MAX_LOADED_MODELS` settings, and available memory). For real parallelism across different models, run workers against separate Ollama hosts with `OLLAMA_HOST`.
 
 If the router agent returns unparseable JSON (or an empty plan), the controller falls back to broadcasting the original prompt to all live workers with a generic system prompt. A subtask that names an unknown worker is reassigned to the first live worker.
 
@@ -97,7 +99,7 @@ agent-cluster/
 - `cmd/controller` — reads env vars and flags, then serves `internal/controller`.
 - `cmd/chat` — interactive terminal chat client.
 - `internal/worker` — `/health` and `/run` handlers. Runs a per-request agent using `task.system_prompt`.
-- `internal/controller` — router agent (task decomposition, `plan.go`), sequential dispatch, synthesizer agent (result merging), and health polling.
+- `internal/controller` — router agent (task decomposition, `plan.go`), concurrent dispatch, synthesizer agent (result merging), and health polling.
 - `internal/agent` — minimal Ollama chat client and agent.
 - `internal/registry` — loads enabled workers from `workers.yaml`. The file is re-read on every request, so edits take effect without a restart.
 - `internal/schemas` — shared JSON types.
@@ -126,7 +128,7 @@ All services accept `--host` (default `0.0.0.0`) and `--port`.
 - `MODEL_ID` — Ollama model to use (default: `gemma4`)
 - `WORKER_STATUS` — status reported in health checks (default: `idle`)
 
-**Controller** (`--port` default `8000`):
+**Controller** (`--port` default `8100`):
 - `ROUTER_MODEL_ID` — Ollama model for the router agent (default: `gemma4`)
 - `SYNTHESIZER_MODEL_ID` — Ollama model for the synthesizer agent (default: `gemma4`)
 - `HEALTH_POLL_INTERVAL` — seconds between background worker health probes (default: `30`)
@@ -136,7 +138,7 @@ All services accept `--host` (default `0.0.0.0`) and `--port`.
 - `OLLAMA_HOST` — Ollama server (default: `http://localhost:11434`)
 
 **Chat client:**
-- `CONTROLLER_URL` or `--url` — base URL of the controller (default: `http://localhost:8000`)
+- `CONTROLLER_URL` or `--url` — base URL of the controller (default: `http://localhost:8100`)
 - `GLAMOUR_STYLE` — Markdown style, e.g. `light` for light terminals (default: `dark`)
 
 ## workers.yaml format

@@ -22,10 +22,14 @@ import (
 // fakeOllama answers /api/chat based on which agent is calling, identified by its system prompt.
 type fakeOllama struct {
 	routerReply string
+	// barrier, if set, makes each worker call wait until this many worker calls are in
+	// flight at once, or give up after a short timeout and reply "TIMED OUT".
+	barrier int
 
 	mu          sync.Mutex
 	workerCalls []agent.ChatRequest
 	synthPrompt string
+	allArrived  chan struct{}
 }
 
 func (f *fakeOllama) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -47,6 +51,22 @@ func (f *fakeOllama) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		f.workerCalls = append(f.workerCalls, req)
 		reply = fmt.Sprintf("%s did: %s", req.Model, user)
+		if f.barrier > 0 {
+			if f.allArrived == nil {
+				f.allArrived = make(chan struct{})
+			}
+			if len(f.workerCalls) == f.barrier {
+				close(f.allArrived)
+			}
+			arrived := f.allArrived
+			f.mu.Unlock()
+			select {
+			case <-arrived:
+			case <-time.After(2 * time.Second):
+				reply = "TIMED OUT"
+			}
+			f.mu.Lock()
+		}
 	}
 	f.mu.Unlock()
 
@@ -68,7 +88,11 @@ type cluster struct {
 // startCluster starts a fake Ollama, the named workers and a controller that knows about them.
 func startCluster(t *testing.T, routerReply string, workerIDs ...string) *cluster {
 	t.Helper()
-	ollama := &fakeOllama{routerReply: routerReply}
+	return startClusterWith(t, &fakeOllama{routerReply: routerReply}, workerIDs...)
+}
+
+func startClusterWith(t *testing.T, ollama *fakeOllama, workerIDs ...string) *cluster {
+	t.Helper()
 	ollamaSrv := httptest.NewServer(ollama)
 	t.Cleanup(ollamaSrv.Close)
 	client := &agent.Client{BaseURL: ollamaSrv.URL, HTTP: ollamaSrv.Client()}
@@ -165,12 +189,34 @@ func TestDispatchEndToEnd(t *testing.T) {
 		}
 	}
 
-	// The worker's system message carries the router-assigned role.
-	if got := c.ollama.workerCalls[0].Messages[0].Content; !strings.HasPrefix(got, "You are a code reviewer.") {
-		t.Errorf("worker system prompt = %q", got)
+	// Each worker's system message carries its router-assigned role. Workers run
+	// concurrently, so match calls by model rather than by order.
+	roles := map[string]string{"model-w1": "You are a code reviewer.", "model-w2": "You are a test engineer."}
+	for _, call := range c.ollama.workerCalls {
+		if got := call.Messages[0].Content; !strings.HasPrefix(got, roles[call.Model]) {
+			t.Errorf("%s system prompt = %q, want prefix %q", call.Model, got, roles[call.Model])
+		}
 	}
 	if !strings.Contains(c.ollama.synthPrompt, "### Worker w2\nmodel-w2 did: Write tests.") {
 		t.Errorf("synthesizer prompt missing worker results:\n%s", c.ollama.synthPrompt)
+	}
+}
+
+func TestDispatchRunsWorkersConcurrently(t *testing.T) {
+	plan := `[{"worker_id": "w1", "system_prompt": "S", "task_prompt": "one"},
+	          {"worker_id": "w2", "system_prompt": "S", "task_prompt": "two"},
+	          {"worker_id": "w3", "system_prompt": "S", "task_prompt": "three"}]`
+	// Every worker call blocks until all three are in flight, so sequential dispatch times out.
+	c := startClusterWith(t, &fakeOllama{routerReply: plan, barrier: 3}, "w1", "w2", "w3")
+
+	status, resp := c.dispatch(t, "do three things")
+	if status != http.StatusOK {
+		t.Fatalf("dispatch status = %d", status)
+	}
+	for i, want := range []string{"model-w1 did: one", "model-w2 did: two", "model-w3 did: three"} {
+		if got := resp.Results[i]; got.WorkerID != fmt.Sprintf("w%d", i+1) || got.Content != want {
+			t.Errorf("result %d = %+v, want %q in plan order", i, got, want)
+		}
 	}
 }
 

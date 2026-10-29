@@ -1,6 +1,6 @@
 // Command controller runs the fleet's LLM-driven router.
 //
-//	ROUTER_MODEL_ID=gemma4 SYNTHESIZER_MODEL_ID=gemma4 go run ./cmd/controller --port 8000
+//	ROUTER_MODEL_ID=gemma4 SYNTHESIZER_MODEL_ID=gemma4 go run ./cmd/controller --port 8100
 package main
 
 import (
@@ -15,7 +15,7 @@ import (
 )
 
 func main() {
-	host, port := httputil.ListenFlags(8000)
+	host, port := httputil.ListenFlags(8100)
 	workersPath := flag.String("workers", httputil.Getenv("WORKERS_FILE", "workers.yaml"), "path to the worker registry")
 	flag.Parse()
 

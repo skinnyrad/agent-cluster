@@ -13,7 +13,7 @@
 ### Architecture
 1.  **Controller (`internal/controller`, run with `cmd/controller`):**
     - **Router Agent:** Decomposes user prompts into `SubTask` objects (JSON).
-    - **Dispatcher:** Sends subtasks to live workers, one at a time.
+    - **Dispatcher:** Sends subtasks to live workers concurrently and keeps results in plan order.
     - **Synthesizer Agent:** Merges worker outputs into a final coherent answer.
     - **Health Monitoring:** Background goroutine that polls workers every `HEALTH_POLL_INTERVAL` (default: 30s) to maintain a list of live nodes.
 2.  **Worker (`internal/worker`, run with `cmd/worker`):**
@@ -66,16 +66,16 @@ WORKER_ID=worker-2 MODEL_ID=gemma4 go run ./cmd/worker --port 8002
 
 **Start Controller** (from the repository root so it finds `workers.yaml`):
 ```bash
-ROUTER_MODEL_ID=gemma4 SYNTHESIZER_MODEL_ID=gemma4 go run ./cmd/controller --port 8000
+ROUTER_MODEL_ID=gemma4 SYNTHESIZER_MODEL_ID=gemma4 go run ./cmd/controller --port 8100
 ```
 
 **Start Interactive Chat Client (recommended for interactive use):**
 ```bash
 go run ./cmd/chat
 # or override the controller URL:
-go run ./cmd/chat --url http://localhost:8000
+go run ./cmd/chat --url http://localhost:8100
 # or via environment variable:
-CONTROLLER_URL=http://localhost:8000 go run ./cmd/chat
+CONTROLLER_URL=http://localhost:8100 go run ./cmd/chat
 ```
 
 The chat client prompts you for input and dispatches each message to the fleet. Use ↑/↓ to recall previous inputs, ←/→ to edit the current line. The last 6 conversation turns are automatically included as context in each request.
@@ -105,7 +105,7 @@ Slash commands available in the chat client:
 - **Interactive Testing:** Use `go run ./cmd/chat` for a full interactive session.
 - **Direct Dispatch Testing:** Test the full pipeline using `POST /dispatch`:
   ```bash
-  curl -X POST http://localhost:8000/dispatch \
+  curl -X POST http://localhost:8100/dispatch \
     -H "Content-Type: application/json" \
     -d '{"prompt": "Your complex task here"}'
   ```
@@ -121,7 +121,7 @@ Slash commands available in the chat client:
 | `HEALTH_POLL_INTERVAL`| `30` | Seconds between worker health checks. |
 | `WORKERS_FILE` | `workers.yaml` | Registry path used by the controller. |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server used by the controller and workers. |
-| `CONTROLLER_URL` | `http://localhost:8000` | Controller base URL used by the chat client. |
+| `CONTROLLER_URL` | `http://localhost:8100` | Controller base URL used by the chat client. |
 | `GLAMOUR_STYLE` | `dark` | Markdown style for the chat client (`light` for light terminals). |
 
 ---

@@ -235,13 +235,15 @@ func (c *controller) dispatch(w http.ResponseWriter, r *http.Request) {
 		workerMap[wk.WorkerID] = wk
 	}
 
-	// Dispatch each subtask to its assigned worker.
-	results := make([]schemas.AgentResult, 0, len(subtasks))
-	for _, st := range subtasks {
+	// Dispatch all subtasks concurrently. Each goroutine writes only its own slot, so
+	// results stay in plan order.
+	results := make([]schemas.AgentResult, len(subtasks))
+	var wg sync.WaitGroup
+	for i, st := range subtasks {
 		wk, ok := workerMap[st.WorkerID]
 		if !ok {
-			results = append(results, failedResult(requestID, st.WorkerID,
-				fmt.Sprintf("Worker '%s' not found in registry", st.WorkerID)))
+			results[i] = failedResult(requestID, st.WorkerID,
+				fmt.Sprintf("Worker '%s' not found in registry", st.WorkerID))
 			continue
 		}
 
@@ -253,15 +255,18 @@ func (c *controller) dispatch(w http.ResponseWriter, r *http.Request) {
 			SessionID:    req.SessionID,
 			UserID:       req.UserID,
 		}
-		result, err := c.runOnWorker(ctx, wk, task)
-		if err != nil {
-			// Mark the worker dead immediately so it's excluded from the next dispatch.
-			c.markDead(wk.WorkerID)
-			results = append(results, failedResult(task.TaskID, wk.WorkerID, err.Error()))
-			continue
-		}
-		results = append(results, *result)
+		wg.Go(func() {
+			result, err := c.runOnWorker(ctx, wk, task)
+			if err != nil {
+				// Mark the worker dead immediately so it's excluded from the next dispatch.
+				c.markDead(wk.WorkerID)
+				results[i] = failedResult(task.TaskID, wk.WorkerID, err.Error())
+				return
+			}
+			results[i] = *result
+		})
 	}
+	wg.Wait()
 
 	// Synthesizer agent: merge all worker results into a final answer.
 	synthesizer := &agent.Agent{

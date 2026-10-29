@@ -62,7 +62,7 @@ For detailed architecture and design decisions, see `Architecture.md`.
 5. **Run the controller** (from the repository root, so it finds `workers.yaml`)
 
    ```bash
-   ROUTER_MODEL_ID=gemma4 SYNTHESIZER_MODEL_ID=gemma4 go run ./cmd/controller --port 8000
+   ROUTER_MODEL_ID=gemma4 SYNTHESIZER_MODEL_ID=gemma4 go run ./cmd/controller --port 8100
    ```
 
 Every service takes `--host` (default `0.0.0.0`) and `--port`. The controller also takes `--workers` to point at a different registry file. Set `OLLAMA_HOST` if Ollama isn't on `http://localhost:11434`.
@@ -78,7 +78,7 @@ Every service takes `--host` (default `0.0.0.0`) and `--port`. The controller al
 - List available workers:
 
   ```bash
-  curl http://localhost:8000/workers
+  curl http://localhost:8100/workers
   ```
 
 - **Interactive chat (recommended):** Start a conversation with the fleet using the built-in terminal client:
@@ -86,9 +86,9 @@ Every service takes `--host` (default `0.0.0.0`) and `--port`. The controller al
   ```bash
   go run ./cmd/chat
   # or point at a non-default controller:
-  go run ./cmd/chat --url http://localhost:8000
+  go run ./cmd/chat --url http://localhost:8100
   # or via environment variable:
-  CONTROLLER_URL=http://localhost:8000 go run ./cmd/chat
+  CONTROLLER_URL=http://localhost:8100 go run ./cmd/chat
   ```
 
   The chat client supports:
@@ -103,7 +103,7 @@ Every service takes `--host` (default `0.0.0.0`) and `--port`. The controller al
 - Dispatch a task directly (the controller decides how many workers to use and what each one does):
 
   ```bash
-  curl -X POST http://localhost:8000/dispatch \
+  curl -X POST http://localhost:8100/dispatch \
     -H "Content-Type: application/json" \
     -d '{"prompt": "Do a code review and write tests for a Python bubble sort function."}'
   ```
