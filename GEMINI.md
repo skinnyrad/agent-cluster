@@ -4,30 +4,29 @@
 `agent-cluster` is a dynamic agent orchestration framework designed for the "AI For TSCM 2" course. It implements a **Controller-Worker** architecture where a central controller uses Large Language Models (LLMs) to decompose complex tasks into subtasks, assign them to a fleet of generic, role-agnostic workers, and synthesize their outputs into a final response.
 
 ### Core Technologies
-- **Language:** Python 3.10+
-- **Agent Framework:** [Agno](https://docs.agno.com) (formerly Phidata)
-- **Web Framework:** [FastAPI](https://fastapi.tiangolo.com/) with Uvicorn
-- **LLM Provider:** [Ollama](https://ollama.com/) (local models like `gemma4` or `llama3.1`)
-- **Data Validation:** [Pydantic v2](https://pydantic.dev/)
-- **Communication:** [HTTPX](https://www.python-httpx.org/) (Asynchronous HTTP)
-- **Configuration:** YAML (`workers.yaml`)
-- **Interactive CLI:** [prompt_toolkit](https://python-prompt-toolkit.readthedocs.io/) (input history, cursor editing) + [Rich](https://rich.readthedocs.io/) (spinners, tables, Markdown rendering)
+- **Language:** Go 1.26+
+- **LLM Provider:** [Ollama](https://ollama.com/) (local models like `gemma4` or `llama3.1`), called directly over its HTTP API
+- **Web Server:** Go standard library `net/http`
+- **Configuration:** YAML (`workers.yaml`, parsed with `gopkg.in/yaml.v3`)
+- **Interactive CLI:** [liner](https://github.com/peterh/liner) (input history, cursor editing) + [Lip Gloss](https://github.com/charmbracelet/lipgloss) (tables, panels) + [Glamour](https://github.com/charmbracelet/glamour) (Markdown rendering)
 
 ### Architecture
-1.  **Controller (`controller.py`):**
-    - **Router Agent:** Decomposes user prompts into specific `SubTask` objects (JSON).
-    - **Dispatcher:** Sends subtasks to available workers concurrently.
+1.  **Controller (`internal/controller`, run with `cmd/controller`):**
+    - **Router Agent:** Decomposes user prompts into `SubTask` objects (JSON).
+    - **Dispatcher:** Sends subtasks to live workers concurrently and keeps results in plan order.
     - **Synthesizer Agent:** Merges worker outputs into a final coherent answer.
-    - **Health Monitoring:** Background task that polls workers every `HEALTH_POLL_INTERVAL` (default: 30s) to maintain a list of live nodes.
-2.  **Worker (`worker.py`):**
+    - **Health Monitoring:** Background goroutine that polls workers every `HEALTH_POLL_INTERVAL` (default: 30s) to maintain a list of live nodes.
+2.  **Worker (`internal/worker`, run with `cmd/worker`):**
     - **Role-Agnostic:** Does not have a fixed persona.
-    - **Dynamic Execution:** Receives a `system_prompt` and `task_prompt` per request, creating a fresh Agno `Agent` for each task to prevent state bleed.
-3.  **Shared Schemas (`schemas.py`):**
-    - Defines the protocol for `AgentTask`, `AgentResult`, `WorkerInfo`, etc., ensuring type safety across the network.
-4.  **Chat Client (`chat.py`):**
-    - **Interactive terminal** session built with `prompt_toolkit` and `Rich`.
-    - Maintains a rolling 6-turn conversation history (`deque(maxlen=12)`) prepended to each dispatch call.
-    - Verbose live spinner showing each pipeline stage in real time.
+    - **Dynamic Execution:** Receives a `system_prompt` and task prompt per request and makes a fresh model call for each task to prevent state bleed.
+3.  **Agent (`internal/agent`):**
+    - Minimal Ollama `/api/chat` client: instructions become the system message, the prompt becomes the user message.
+4.  **Shared Schemas (`internal/schemas`):**
+    - Defines the JSON protocol for `AgentTask`, `AgentResult`, `WorkerInfo`, etc.
+5.  **Chat Client (`cmd/chat`):**
+    - Interactive terminal session.
+    - Maintains a rolling 6-turn conversation history (12 messages) prepended to each dispatch call.
+    - Live spinner showing each pipeline stage.
     - Slash commands: `/workers`, `/clear`, `/help`, `/quit`.
 
 ---
@@ -35,14 +34,12 @@
 ## Building and Running
 
 ### 1. Prerequisites
-- Python 3.10+
+- Go 1.26+
 - Ollama installed and running with the required models (e.g., `ollama pull gemma4`).
 
-### 2. Setup
+### 2. Build
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+go build -o bin/ ./cmd/...
 ```
 
 ### 3. Configuration
@@ -61,24 +58,24 @@ workers:
 Run as many workers as defined in `workers.yaml` on their respective ports.
 ```bash
 # Worker 1
-WORKER_ID=worker-1 MODEL_ID=gemma4 uvicorn worker:app --host 0.0.0.0 --port 8001
+WORKER_ID=worker-1 MODEL_ID=gemma4 go run ./cmd/worker --port 8001
 
 # Worker 2
-WORKER_ID=worker-2 MODEL_ID=gemma4 uvicorn worker:app --host 0.0.0.0 --port 8002
+WORKER_ID=worker-2 MODEL_ID=gemma4 go run ./cmd/worker --port 8002
 ```
 
-**Start Controller:**
+**Start Controller** (from the repository root so it finds `workers.yaml`):
 ```bash
-ROUTER_MODEL_ID=gemma4 SYNTHESIZER_MODEL_ID=gemma4 uvicorn controller:app --host 0.0.0.0 --port 8000
+ROUTER_MODEL_ID=gemma4 SYNTHESIZER_MODEL_ID=gemma4 go run ./cmd/controller --port 8100
 ```
 
 **Start Interactive Chat Client (recommended for interactive use):**
 ```bash
-python chat.py
+go run ./cmd/chat
 # or override the controller URL:
-python chat.py --url http://localhost:8000
+go run ./cmd/chat --url http://localhost:8100
 # or via environment variable:
-CONTROLLER_URL=http://localhost:8000 python chat.py
+CONTROLLER_URL=http://localhost:8100 go run ./cmd/chat
 ```
 
 The chat client prompts you for input and dispatches each message to the fleet. Use ↑/↓ to recall previous inputs, ←/→ to edit the current line. The last 6 conversation turns are automatically included as context in each request.
@@ -97,16 +94,18 @@ Slash commands available in the chat client:
 ## Development Conventions
 
 ### Coding Style
-- **Type Hinting:** Strictly use Python type hints for all function signatures and Pydantic models.
-- **Asynchronous I/O:** Use `async/await` for all network calls (FastAPI endpoints, HTTPX client).
-- **Schema-First:** Update `schemas.py` before changing the communication logic between controller and workers.
+- **Formatting:** Run `gofmt` (or `go fmt ./...`) and `go vet ./...` before committing.
+- **Context:** Pass `context.Context` through every network call so client disconnects cancel model calls.
+- **Schema-First:** Update `internal/schemas` before changing the communication logic between controller and workers. Keep JSON field names snake_case so the wire format stays stable.
+- **Thin commands:** Keep `cmd/*` to flag/env parsing; put logic in `internal/*` so it can be tested.
 
 ### Testing and Validation
+- **Unit and integration tests:** `go test ./...` (the controller tests spin up real workers against a fake Ollama, so no models are needed). Use `go test -race ./...` when touching concurrency.
 - **Health Checks:** Use `GET /health` on workers and `GET /workers` on the controller to verify system state.
-- **Interactive Testing:** Use `python chat.py` for a full interactive session with verbose status output and conversation history.
+- **Interactive Testing:** Use `go run ./cmd/chat` for a full interactive session.
 - **Direct Dispatch Testing:** Test the full pipeline using `POST /dispatch`:
   ```bash
-  curl -X POST http://localhost:8000/dispatch \
+  curl -X POST http://localhost:8100/dispatch \
     -H "Content-Type: application/json" \
     -d '{"prompt": "Your complex task here"}'
   ```
@@ -116,17 +115,25 @@ Slash commands available in the chat client:
 |---|---|---|
 | `WORKER_ID` | `worker-1` | Unique ID for the worker instance. |
 | `MODEL_ID` | `gemma4` | Ollama model ID for the worker. |
+| `WORKER_STATUS` | `idle` | Status reported by the worker's `/health`. |
 | `ROUTER_MODEL_ID` | `gemma4` | Ollama model for task decomposition. |
 | `SYNTHESIZER_MODEL_ID` | `gemma4` | Ollama model for result merging. |
 | `HEALTH_POLL_INTERVAL`| `30` | Seconds between worker health checks. |
-| `CONTROLLER_URL` | `http://localhost:8000` | Controller base URL used by `chat.py`. |
+| `WORKER_TIMEOUT` | `300` | Seconds each worker gets per subtask. Timed-out workers stay live. |
+| `WORKERS_FILE` | `workers.yaml` | Registry path used by the controller. |
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server used by the controller and workers. |
+| `CONTROLLER_URL` | `http://localhost:8100` | Controller base URL used by the chat client. |
+| `CHAT_TIMEOUT` | `900` | Seconds the chat client waits for each dispatch. |
+| `GLAMOUR_STYLE` | `dark` | Markdown style for the chat client (`light` for light terminals). |
 
 ---
 
 ## Key Files
-- `controller.py`: Main orchestration logic and LLM pipeline.
-- `worker.py`: Generic execution node.
-- `schemas.py`: Shared Pydantic models.
+- `internal/controller/controller.go`: Main orchestration logic and LLM pipeline.
+- `internal/controller/plan.go`: Router output parsing and broadcast fallback.
+- `internal/worker/worker.go`: Generic execution node.
+- `internal/agent/agent.go`: Ollama-backed agent.
+- `internal/schemas/schemas.go`: Shared JSON types.
 - `workers.yaml`: Fleet registration.
-- `chat.py`: Interactive terminal chat client (uses `prompt_toolkit` + `Rich`).
+- `cmd/chat/`: Interactive terminal chat client.
 - `Architecture.md`: Detailed design documentation.
